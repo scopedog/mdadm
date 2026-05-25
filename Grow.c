@@ -1813,6 +1813,254 @@ error:
 	return 1;
 }
 
+/*
+ * raidkm_grow_parity() - add parity disk(s) to a raidkm (level 71) array.
+ *
+ * raidkm keeps data on disks [0, raid_disks - m) and never relocates it
+ * (PARITY_N layout), so "add a parity" leaves the data-disk count unchanged
+ * and only requires the parity to be recomputed for the new m.  There is no
+ * in-kernel online reshape for this yet, so we perform it offline but
+ * data-preserving ("grow via resync"):
+ *
+ *   1. capture the live geometry (member devices in role order, their shared
+ *      data_offset, chunk, component size, uuid and name);
+ *   2. stop the array;
+ *   3. recreate it at the new m with the extra disk(s) appended in the same
+ *      role order, the same data_offset/uuid/name, and WITHOUT --assume-clean.
+ *
+ * md's normal initial resync then recomputes all parity from the untouched
+ * data, and the array is online and serving I/O throughout that resync.  The
+ * only window that is not crash-safe is the brief stop+recreate; a true
+ * online reshape would remove even that, but needs kernel reshape plumbing.
+ *
+ * Called from Grow_reshape() for level-71 arrays.  'devlist' holds the
+ * disk(s) supplied with --add; 'array' is the live array info.
+ */
+static int raidkm_grow_parity(char *devname, int fd,
+			      struct mddev_dev *devlist,
+			      struct context *c, struct shape *s,
+			      struct mdu_array_info_s *array)
+{
+	struct mdinfo *sra = NULL, *mdi;
+	struct supertype *st = NULL, *nst = NULL;
+	struct mddev_ident ident;
+	struct shape news;
+	struct context cc;
+	struct mddev_dev *complist = NULL, **tail = &complist, *dv, *nd;
+	char *paths[RAIDKM_MAX_DISKS];
+	unsigned long long data_offset = INVALID_SECTORS;
+	int old_n = array->raid_disks;
+	int old_m = array->layout;
+	int new_n = s->raiddisks;
+	int new_m, k, added_needed, n_added = 0, i;
+	int uuid[4], uuid_set = 0;
+	char name[33] = "";
+	char mdesc[16];
+	int dfd, rv = 1;
+	char *endp = NULL;
+
+	for (i = 0; i < RAIDKM_MAX_DISKS; i++)
+		paths[i] = NULL;
+
+	/* --- parse and validate the requested geometry --- */
+	if (!s->layout_str) {
+		pr_err("raidkm grow: use --layout=<m> to set the new parity count\n");
+		return 1;
+	}
+	new_m = strtol(s->layout_str, &endp, 10);
+	if (!endp || *endp || new_m < RAIDKM_MIN_M || new_m > RAIDKM_MAX_M) {
+		pr_err("raidkm grow: --layout must be an integer m in [%d,%d]\n",
+		       RAIDKM_MIN_M, RAIDKM_MAX_M);
+		return 1;
+	}
+	if (new_m <= old_m) {
+		pr_err("raidkm grow: new m (%d) must exceed current m (%d); reducing parity is not supported\n",
+		       new_m, old_m);
+		return 1;
+	}
+	k = old_n - old_m;			/* data disks - unchanged */
+	if (new_n == 0)
+		new_n = k + new_m;		/* allow --layout without -n */
+	if (new_n - new_m != k) {
+		pr_err("raidkm grow: adding parity must keep the data-disk count constant (%d).\n"
+		       "    For m=%d use --raid-devices=%d (got %d).\n",
+		       k, new_m, k + new_m, new_n);
+		return 1;
+	}
+	if (new_n > RAIDKM_MAX_DISKS) {
+		pr_err("raidkm grow: no more than %d raid-devices supported\n",
+		       RAIDKM_MAX_DISKS);
+		return 1;
+	}
+	added_needed = new_n - old_n;		/* == new_m - old_m */
+
+	if (array->active_disks < old_n) {
+		pr_err("raidkm grow: array is degraded (%d of %d disks present); refusing to grow parity\n",
+		       array->active_disks, old_n);
+		return 1;
+	}
+
+	/* count and sanity-check the --add devices BEFORE stopping anything */
+	for (dv = devlist; dv; dv = dv->next)
+		n_added++;
+	if (n_added != added_needed) {
+		pr_err("raidkm grow: m %d->%d needs exactly %d new disk(s) via --add (got %d)\n",
+		       old_m, new_m, added_needed, n_added);
+		return 1;
+	}
+	for (dv = devlist; dv; dv = dv->next) {
+		dfd = dev_open(dv->devname, O_RDONLY | O_EXCL);
+		if (dfd < 0) {
+			pr_err("raidkm grow: cannot open new device %s exclusively: %s\n",
+			       dv->devname, strerror(errno));
+			return 1;
+		}
+		close(dfd);
+	}
+
+	/* --- capture live geometry --- */
+	sra = sysfs_read(fd, NULL,
+			 GET_DEVS | GET_OFFSET | GET_STATE | GET_COMPONENT);
+	if (!sra) {
+		pr_err("raidkm grow: cannot read array state for %s\n", devname);
+		return 1;
+	}
+	for (mdi = sra->devs; mdi; mdi = mdi->next) {
+		int role = mdi->disk.raid_disk;
+
+		if (role < 0 || role >= old_n || paths[role])
+			continue;	/* spares / replacements / dups */
+		paths[role] = map_dev(mdi->disk.major, mdi->disk.minor, 0);
+		if (data_offset == INVALID_SECTORS)
+			data_offset = mdi->data_offset;
+		else if (mdi->data_offset != data_offset) {
+			pr_err("raidkm grow: members have differing data offsets; not supported\n");
+			goto out;
+		}
+	}
+	for (i = 0; i < old_n; i++)
+		if (!paths[i]) {
+			pr_err("raidkm grow: could not resolve member device for slot %d\n", i);
+			goto out;
+		}
+
+	/* preserve uuid + name (and metadata version) from a live member */
+	st = super_by_fd(fd, NULL);
+	if (!st) {
+		pr_err("raidkm grow: cannot determine metadata type for %s\n", devname);
+		goto out;
+	}
+	snprintf(mdesc, sizeof(mdesc), "1.%d", st->minor_version);
+	dfd = dev_open(paths[0], O_RDONLY);
+	if (dfd >= 0) {
+		if (st->ss->load_super(st, dfd, NULL) == 0) {
+			struct mdinfo inf;
+			unsigned char *ub;
+			char ustr[40];
+
+			memset(&inf, 0, sizeof(inf));
+			st->ss->getinfo_super(st, &inf, NULL);
+			/* getinfo returns the uuid as raw set_uuid bytes;
+			 * init_super (via copy_uuid) wants the parse_uuid
+			 * representation, so round-trip through the hex
+			 * string that --examine prints. */
+			ub = (unsigned char *)inf.uuid;
+			snprintf(ustr, sizeof(ustr),
+				 "%02x%02x%02x%02x:%02x%02x%02x%02x:"
+				 "%02x%02x%02x%02x:%02x%02x%02x%02x",
+				 ub[0], ub[1], ub[2], ub[3], ub[4], ub[5],
+				 ub[6], ub[7], ub[8], ub[9], ub[10], ub[11],
+				 ub[12], ub[13], ub[14], ub[15]);
+			uuid_set = parse_uuid(ustr, uuid);
+			snprintf(name, sizeof(name), "%s", inf.name);
+			st->ss->free_super(st);
+		}
+		close(dfd);
+	}
+	if (!uuid_set)
+		pr_err("raidkm grow: warning - could not read member superblock; array will get a fresh UUID\n");
+
+	/* fresh supertype of the same metadata version for the recreate */
+	nst = st->ss->match_metadata_desc(mdesc);
+	if (!nst) {
+		pr_err("raidkm grow: cannot get metadata handler for %s\n", mdesc);
+		goto out;
+	}
+
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: %s m=%d -> m=%d (raid-devices %d -> %d); "
+		       "stopping and recreating to recompute parity (data preserved)\n",
+		       devname, old_m, new_m, old_n, new_n);
+
+	/* --- stop the array (fd is invalid afterwards) --- */
+	if (Manage_stop(devname, fd, c->verbose, 0)) {
+		pr_err("raidkm grow: failed to stop %s; array NOT modified\n", devname);
+		goto out;
+	}
+
+	/* --- recreate at the new geometry --- */
+	for (i = 0; i < old_n; i++) {
+		nd = xcalloc(1, sizeof(*nd));
+		nd->devname = paths[i];
+		nd->data_offset = INVALID_SECTORS;
+		*tail = nd;
+		tail = &nd->next;
+	}
+	for (dv = devlist; dv; dv = dv->next) {
+		nd = xcalloc(1, sizeof(*nd));
+		nd->devname = dv->devname;
+		nd->data_offset = INVALID_SECTORS;
+		*tail = nd;
+		tail = &nd->next;
+	}
+
+	memset(&ident, 0, sizeof(ident));
+	ident.devname = devname;
+	ident.super_minor = UnSet;
+	ident.level = LEVEL_RAIDKM;
+	ident.raid_disks = new_n;
+	if (uuid_set) {
+		memcpy(ident.uuid, uuid, sizeof(uuid));
+		ident.uuid_set = 1;
+	}
+	if (name[0])
+		snprintf(ident.name, sizeof(ident.name), "%s", name);
+
+	memset(&news, 0, sizeof(news));
+	news.level = LEVEL_RAIDKM;
+	news.raiddisks = new_n;
+	news.layout = new_m;			/* raidkm: layout == m */
+	news.chunk = array->chunk_size / 1024;	/* KiB */
+	news.size = sra->component_size / 2;	/* KiB (sectors/2) */
+	news.data_offset = data_offset;		/* sectors - keep data aligned */
+	news.assume_clean = 0;			/* DO resync: recompute parity */
+	news.btype = BitmapNone;
+	news.bitmap_chunk = UnSet;
+	news.consistency_policy = CONSISTENCY_POLICY_UNKNOWN;
+
+	cc = *c;
+	cc.force = 1;	/* members carry old superblocks - expected */
+	cc.runstop = 1;	/* suppress the "continue creating?" prompt and start
+			 * the array; resync still runs (assume_clean == 0) */
+
+	rv = Create(nst, &ident, new_n, complist, &news, &cc);
+	if (rv == 0 && c->verbose >= 0)
+		pr_err("raidkm grow: %s now m=%d; parity is being recomputed by resync (array is online)\n",
+		       devname, new_m);
+
+out:
+	while (complist) {
+		nd = complist;
+		complist = complist->next;
+		free(nd);
+	}
+	for (i = 0; i < old_n; i++)
+		free(paths[i]);
+	if (sra)
+		sysfs_free(sra);
+	return rv;
+}
+
 int Grow_reshape(char *devname, int fd,
 		 struct mddev_dev *devlist,
 		 struct context *c, struct shape *s)
@@ -1855,6 +2103,12 @@ int Grow_reshape(char *devname, int fd,
 			devname);
 		return 1;
 	}
+
+	/* raidkm (level 71) grows parity via stop+recreate+resync, not the
+	 * generic reshape path - it has no kernel online reshape support. */
+	if (array.level == LEVEL_RAIDKM)
+		return raidkm_grow_parity(devname, fd, devlist, c, s, &array);
+
 	if (s->level != UnSet && s->chunk) {
 		pr_err("Cannot change array level in the same operation as changing chunk size.\n");
 		return 1;
