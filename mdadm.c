@@ -1603,13 +1603,16 @@ int main(int argc, char *argv[])
 		break;
 
 	case GROW:
-		/* raidkm parity grow: "--grow --layout=<m> --add <disk>..."
-		 * does not need --raid-devices - the new count is just the
-		 * current count plus the added disks (raidkm only ever grows
-		 * parity, data disks are fixed).  Derive it here so the
-		 * command reaches Grow_reshape() instead of the spare-add
-		 * path.  An explicit --raid-devices still wins. */
-		if (array.level == LEVEL_RAIDKM && s.layout_str &&
+		/* raidkm parity grow via --add.  For raidkm the only --grow
+		 * "--add" operation is adding parity (data disks are fixed),
+		 * so neither --raid-devices nor --layout is required: the new
+		 * count is the current count plus the added disks, and the new
+		 * m follows (or --layout overrides).  Derive raid_disks here so
+		 * the command reaches Grow_reshape() rather than the spare-add
+		 * path.  (To add a hot spare instead, use MANAGE-mode --add:
+		 * "mdadm /dev/mdN --add <disk>" without --grow.)  An explicit
+		 * --raid-devices still wins. */
+		if (array.level == LEVEL_RAIDKM &&
 		    s.raiddisks == 0 && devs_found > 1)
 			s.raiddisks = array.raid_disks + (devs_found - 1);
 		if (array_size > 0) {

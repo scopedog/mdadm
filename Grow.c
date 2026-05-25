@@ -1863,24 +1863,51 @@ static int raidkm_grow_parity(char *devname, int fd,
 		paths[i] = NULL;
 
 	/* --- parse and validate the requested geometry --- */
-	if (!s->layout_str) {
-		pr_err("raidkm grow: use --layout=<m> to set the new parity count\n");
+
+	/* count the --add disks first; for raidkm a grow adds parity, so each
+	 * added disk is one more parity unless --layout overrides. */
+	for (dv = devlist; dv; dv = dv->next)
+		n_added++;
+	if (n_added == 0) {
+		pr_err("raidkm grow: supply the new parity disk(s) with --add\n");
 		return 1;
 	}
-	new_m = strtol(s->layout_str, &endp, 10);
-	if (!endp || *endp || new_m < RAIDKM_MIN_M || new_m > RAIDKM_MAX_M) {
-		pr_err("raidkm grow: --layout must be an integer m in [%d,%d]\n",
-		       RAIDKM_MIN_M, RAIDKM_MAX_M);
-		return 1;
+	for (dv = devlist; dv; dv = dv->next) {
+		dfd = dev_open(dv->devname, O_RDONLY | O_EXCL);
+		if (dfd < 0) {
+			pr_err("raidkm grow: cannot open new device %s exclusively: %s\n",
+			       dv->devname, strerror(errno));
+			return 1;
+		}
+		close(dfd);
+	}
+
+	k = old_n - old_m;			/* data disks - unchanged */
+
+	/* new m: explicit --layout if given, else implied by #added disks */
+	if (s->layout_str) {
+		new_m = strtol(s->layout_str, &endp, 10);
+		if (!endp || *endp || new_m < RAIDKM_MIN_M ||
+		    new_m > RAIDKM_MAX_M) {
+			pr_err("raidkm grow: --layout must be an integer m in [%d,%d]\n",
+			       RAIDKM_MIN_M, RAIDKM_MAX_M);
+			return 1;
+		}
+	} else {
+		new_m = old_m + n_added;	/* bare --add: +1 parity per disk */
 	}
 	if (new_m <= old_m) {
 		pr_err("raidkm grow: new m (%d) must exceed current m (%d); reducing parity is not supported\n",
 		       new_m, old_m);
 		return 1;
 	}
-	k = old_n - old_m;			/* data disks - unchanged */
+	if (new_m > RAIDKM_MAX_M) {
+		pr_err("raidkm grow: m may not exceed %d (requested %d)\n",
+		       RAIDKM_MAX_M, new_m);
+		return 1;
+	}
 	if (new_n == 0)
-		new_n = k + new_m;		/* allow --layout without -n */
+		new_n = k + new_m;		/* derive count from m if not given */
 	if (new_n - new_m != k) {
 		pr_err("raidkm grow: adding parity must keep the data-disk count constant (%d).\n"
 		       "    For m=%d use --raid-devices=%d (got %d).\n",
@@ -1893,29 +1920,16 @@ static int raidkm_grow_parity(char *devname, int fd,
 		return 1;
 	}
 	added_needed = new_n - old_n;		/* == new_m - old_m */
-
-	if (array->active_disks < old_n) {
-		pr_err("raidkm grow: array is degraded (%d of %d disks present); refusing to grow parity\n",
-		       array->active_disks, old_n);
-		return 1;
-	}
-
-	/* count and sanity-check the --add devices BEFORE stopping anything */
-	for (dv = devlist; dv; dv = dv->next)
-		n_added++;
 	if (n_added != added_needed) {
 		pr_err("raidkm grow: m %d->%d needs exactly %d new disk(s) via --add (got %d)\n",
 		       old_m, new_m, added_needed, n_added);
 		return 1;
 	}
-	for (dv = devlist; dv; dv = dv->next) {
-		dfd = dev_open(dv->devname, O_RDONLY | O_EXCL);
-		if (dfd < 0) {
-			pr_err("raidkm grow: cannot open new device %s exclusively: %s\n",
-			       dv->devname, strerror(errno));
-			return 1;
-		}
-		close(dfd);
+
+	if (array->active_disks < old_n) {
+		pr_err("raidkm grow: array is degraded (%d of %d disks present); refusing to grow parity\n",
+		       array->active_disks, old_n);
+		return 1;
 	}
 
 	/* --- capture live geometry --- */
