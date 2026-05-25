@@ -1603,6 +1603,15 @@ int main(int argc, char *argv[])
 		break;
 
 	case GROW:
+		/* raidkm parity grow: "--grow --layout=<m> --add <disk>..."
+		 * does not need --raid-devices - the new count is just the
+		 * current count plus the added disks (raidkm only ever grows
+		 * parity, data disks are fixed).  Derive it here so the
+		 * command reaches Grow_reshape() instead of the spare-add
+		 * path.  An explicit --raid-devices still wins. */
+		if (array.level == LEVEL_RAIDKM && s.layout_str &&
+		    s.raiddisks == 0 && devs_found > 1)
+			s.raiddisks = array.raid_disks + (devs_found - 1);
 		if (array_size > 0) {
 			/* alway impose array size first, independent of
 			 * anything else
