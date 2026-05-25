@@ -569,6 +569,12 @@ int enough(int level, int raid_disks, int layout, int clean, char *avail)
 			return avail_disks >= raid_disks - 2;
 		else
 			return avail_disks >= raid_disks;
+	case LEVEL_RAIDKM:
+		/* layout carries m; tolerate up to m missing when clean */
+		if (clean)
+			return avail_disks >= raid_disks - layout;
+		else
+			return avail_disks >= raid_disks;
 	default:
 		return 0;
 	}
@@ -910,6 +916,8 @@ int get_data_disks(int level, int layout, int raid_disks)
 	case 5: data_disks = raid_disks - 1;
 		break;
 	case 6: data_disks = raid_disks - 2;
+		break;
+	case LEVEL_RAIDKM: data_disks = raid_disks - layout; /* layout == m */
 		break;
 	case 10: data_disks = raid_disks / (layout & 255) / ((layout>>8)&255);
 		break;

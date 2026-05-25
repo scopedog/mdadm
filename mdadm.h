@@ -1949,6 +1949,15 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
 #define	LEVEL_LINEAR		(-1)
 #define	LEVEL_FAULTY		(-5)
 
+/* raidkm: out-of-tree k+m Reed-Solomon md personality (effective raid6).
+ * Uses the 'layout' field to carry m (number of parity disks, 2..8) rather
+ * than a parity-placement algorithm; placement is always PARITY_N.
+ */
+#define	LEVEL_RAIDKM		(71)
+#define	RAIDKM_MIN_M		(2)
+#define	RAIDKM_MAX_M		(8)
+#define	RAIDKM_MAX_DISKS	(32)
+
 /* kernel module doesn't know about these */
 #define LEVEL_CONTAINER		(-100)
 #define	LEVEL_UNSUPPORTED	(-200)

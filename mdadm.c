@@ -613,6 +613,18 @@ int main(int argc, char *argv[])
 					exit(2);
 				}
 				break;
+			case LEVEL_RAIDKM:
+				/* raidkm overloads layout to carry m, the
+				 * number of parity disks (Reed-Solomon).
+				 */
+				if (parse_num(&s.layout, optarg) != 0 ||
+				    s.layout < RAIDKM_MIN_M ||
+				    s.layout > RAIDKM_MAX_M) {
+					pr_err("layout for raidkm must be an integer m (number of parity disks) between %d and %d, not %s\n",
+						RAIDKM_MIN_M, RAIDKM_MAX_M, optarg);
+					exit(2);
+				}
+				break;
 			case LEVEL_FAULTY:
 				/* Faulty
 				 * modeNNN

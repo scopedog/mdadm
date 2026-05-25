@@ -87,6 +87,11 @@ int default_layout(struct supertype *st, int level, int verbose)
 	case 6:
 		layout_map = r5layout;
 		break;
+	case LEVEL_RAIDKM:
+		/* layout carries m; default to 2 parity disks */
+		layout = RAIDKM_MIN_M;
+		layout_name = "m=2";
+		break;
 	case LEVEL_FAULTY:
 		layout_map = faultylayout;
 		break;
@@ -558,6 +563,25 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 		pr_err("no more than 256 raid-devices supported for level 6\n");
 		return 1;
 	}
+	if (s->level == LEVEL_RAIDKM) {
+		int m = (s->layout == UnSet) ? RAIDKM_MIN_M : s->layout;
+
+		if (m < RAIDKM_MIN_M || m > RAIDKM_MAX_M) {
+			pr_err("raidkm requires m (parity disks) between %d and %d (set via --layout)\n",
+			       RAIDKM_MIN_M, RAIDKM_MAX_M);
+			return 1;
+		}
+		if (s->raiddisks <= m) {
+			pr_err("raidkm needs at least %d raid-devices for m=%d (one or more data disks plus %d parity)\n",
+			       m + 1, m, m);
+			return 1;
+		}
+		if (s->raiddisks > RAIDKM_MAX_DISKS) {
+			pr_err("no more than %d raid-devices supported for raidkm\n",
+			       RAIDKM_MAX_DISKS);
+			return 1;
+		}
+	}
 	if (s->raiddisks < 2 && s->level >= 4) {
 		pr_err("at least 2 raid-devices needed for level %d\n", s->level);
 		return 1;
@@ -643,6 +667,7 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 	case 5:
 	case 10:
 	case 6:
+	case LEVEL_RAIDKM:
 	case 0:
 		if (s->chunk == 0 || s->chunk == UnSet) {
 			s->chunk = UnSet;

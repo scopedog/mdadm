@@ -388,6 +388,10 @@ static void examine_super1(struct supertype *st, char *homehost)
 		case 4:
 		case 5: ddsks = __le32_to_cpu(sb->raid_disks)-1; break;
 		case 6: ddsks = __le32_to_cpu(sb->raid_disks)-2; break;
+		case LEVEL_RAIDKM: /* layout carries m */
+			ddsks = __le32_to_cpu(sb->raid_disks) -
+				__le32_to_cpu(sb->layout);
+			break;
 		case 10:
 			layout = __le32_to_cpu(sb->layout);
 			ddsks = __le32_to_cpu(sb->raid_disks);
@@ -541,12 +545,16 @@ static void examine_super1(struct supertype *st, char *homehost)
 		print_r10_layout(lo);
 		printf("\n");
 	}
+	if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM)
+		printf("         Layout : m=%d (parity disks)\n",
+		       __le32_to_cpu(sb->layout));
 	switch(__le32_to_cpu(sb->level)) {
 	case 0:
 	case 4:
 	case 5:
 	case 6:
 	case 10:
+	case LEVEL_RAIDKM:
 		printf("     Chunk Size : %dK\n",
 		       __le32_to_cpu(sb->chunksize)/2);
 		break;
@@ -679,6 +687,10 @@ static void export_examine_super1(struct supertype *st)
 				break;
 			case 6:
 				ddsks = __le32_to_cpu(sb->raid_disks)-2;
+				break;
+			case LEVEL_RAIDKM:
+				ddsks = __le32_to_cpu(sb->raid_disks) -
+					__le32_to_cpu(sb->layout);
 				break;
 			case 10:
 				layout = __le32_to_cpu(sb->layout);
