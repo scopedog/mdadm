@@ -1255,8 +1255,8 @@ int main(int argc, char *argv[])
 			       map_num_s(consistency_policies, s.consistency_policy));
 			exit(2);
 		} else if (s.consistency_policy == CONSISTENCY_POLICY_PPL &&
-			   s.level != 5) {
-			pr_err("PPL consistency policy is only supported for RAID level 5.\n");
+			   s.level != 5 && s.level != LEVEL_RAIDKM) {
+			pr_err("PPL consistency policy is only supported for RAID level 5 or raidkm.\n");
 			exit(2);
 		} else if (s.consistency_policy == CONSISTENCY_POLICY_BITMAP &&
 			   s.btype == BitmapNone) {
