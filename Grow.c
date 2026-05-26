@@ -1850,7 +1850,8 @@ static int raidkm_grow_parity(char *devname, int fd,
 	char *paths[RAIDKM_MAX_DISKS];
 	unsigned long long data_offset = INVALID_SECTORS;
 	int old_n = array->raid_disks;
-	int old_m = array->layout;
+	int old_rotating = !!(array->layout & RAIDKM_LAYOUT_ROTATING);
+	int old_m = RAIDKM_LAYOUT_M(array->layout);
 	int new_n = s->raiddisks;
 	int new_m, k, added_needed, n_added = 0, i;
 	int uuid[4], uuid_set = 0;
@@ -1870,6 +1871,14 @@ static int raidkm_grow_parity(char *devname, int fd,
 		n_added++;
 	if (n_added == 0) {
 		pr_err("raidkm grow: supply the new parity disk(s) with --add\n");
+		return 1;
+	}
+	if (old_rotating) {
+		/* The cheap grow-via-resync relies on PARITY_N's prefix property
+		 * (append a parity disk, recompute parity, no data movement).  A
+		 * rotating array would need a full restripe (every block moves),
+		 * which is a real online reshape — not implemented. */
+		pr_err("raidkm grow: adding parity is not supported on a rotating-layout array (it would require a full restripe)\n");
 		return 1;
 	}
 	for (dv = devlist; dv; dv = dv->next) {

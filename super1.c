@@ -388,9 +388,9 @@ static void examine_super1(struct supertype *st, char *homehost)
 		case 4:
 		case 5: ddsks = __le32_to_cpu(sb->raid_disks)-1; break;
 		case 6: ddsks = __le32_to_cpu(sb->raid_disks)-2; break;
-		case LEVEL_RAIDKM: /* layout carries m */
+		case LEVEL_RAIDKM: /* layout low byte carries m */
 			ddsks = __le32_to_cpu(sb->raid_disks) -
-				__le32_to_cpu(sb->layout);
+				RAIDKM_LAYOUT_M(__le32_to_cpu(sb->layout));
 			break;
 		case 10:
 			layout = __le32_to_cpu(sb->layout);
@@ -545,9 +545,12 @@ static void examine_super1(struct supertype *st, char *homehost)
 		print_r10_layout(lo);
 		printf("\n");
 	}
-	if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM)
-		printf("         Layout : m=%d (parity disks)\n",
-		       __le32_to_cpu(sb->layout));
+	if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM) {
+		unsigned int rkl = __le32_to_cpu(sb->layout);
+		printf("         Layout : m=%d (parity disks), %s\n",
+		       RAIDKM_LAYOUT_M(rkl),
+		       (rkl & RAIDKM_LAYOUT_ROTATING) ? "rotating" : "parity-N");
+	}
 	switch(__le32_to_cpu(sb->level)) {
 	case 0:
 	case 4:
@@ -690,7 +693,7 @@ static void export_examine_super1(struct supertype *st)
 				break;
 			case LEVEL_RAIDKM:
 				ddsks = __le32_to_cpu(sb->raid_disks) -
-					__le32_to_cpu(sb->layout);
+					RAIDKM_LAYOUT_M(__le32_to_cpu(sb->layout));
 				break;
 			case 10:
 				layout = __le32_to_cpu(sb->layout);

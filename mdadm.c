@@ -613,18 +613,42 @@ int main(int argc, char *argv[])
 					exit(2);
 				}
 				break;
-			case LEVEL_RAIDKM:
-				/* raidkm overloads layout to carry m, the
-				 * number of parity disks (Reed-Solomon).
+			case LEVEL_RAIDKM: {
+				/* raidkm overloads layout: low byte carries m
+				 * (parity disks, Reed-Solomon); an optional 'r'
+				 * suffix (or "-rotating") sets the rotating-parity
+				 * bit.  Plain "N" is PARITY_N (the default).
 				 */
-				if (parse_num(&s.layout, optarg) != 0 ||
-				    s.layout < RAIDKM_MIN_M ||
-				    s.layout > RAIDKM_MAX_M) {
-					pr_err("layout for raidkm must be an integer m (number of parity disks) between %d and %d, not %s\n",
+				char buf[32];
+				int rotating = 0;
+				size_t n = strlen(optarg);
+
+				if (n && (optarg[n-1] == 'r' || optarg[n-1] == 'R')) {
+					rotating = 1;
+					n--;
+				} else if (n > 9 &&
+					   strcasecmp(optarg + n - 9, "-rotating") == 0) {
+					rotating = 1;
+					n -= 9;
+				}
+				if (n == 0 || n >= sizeof(buf)) {
+					pr_err("layout for raidkm must be an integer m in [%d,%d], optionally with an 'r' suffix for rotating parity, not %s\n",
 						RAIDKM_MIN_M, RAIDKM_MAX_M, optarg);
 					exit(2);
 				}
+				memcpy(buf, optarg, n);
+				buf[n] = '\0';
+				if (parse_num(&s.layout, buf) != 0 ||
+				    s.layout < RAIDKM_MIN_M ||
+				    s.layout > RAIDKM_MAX_M) {
+					pr_err("layout for raidkm must be an integer m (number of parity disks) between %d and %d, optionally with an 'r' suffix, not %s\n",
+						RAIDKM_MIN_M, RAIDKM_MAX_M, optarg);
+					exit(2);
+				}
+				if (rotating)
+					s.layout |= RAIDKM_LAYOUT_ROTATING;
 				break;
+			}
 			case LEVEL_FAULTY:
 				/* Faulty
 				 * modeNNN

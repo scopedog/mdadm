@@ -564,7 +564,8 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 		return 1;
 	}
 	if (s->level == LEVEL_RAIDKM) {
-		int m = (s->layout == UnSet) ? RAIDKM_MIN_M : s->layout;
+		int m = (s->layout == UnSet) ? RAIDKM_MIN_M
+					     : RAIDKM_LAYOUT_M(s->layout);
 
 		if (m < RAIDKM_MIN_M || m > RAIDKM_MAX_M) {
 			pr_err("raidkm requires m (parity disks) between %d and %d (set via --layout)\n",
