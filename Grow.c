@@ -1848,18 +1848,43 @@ static int raidkm_grow_data(char *devname, int fd, struct mddev_dev *devlist,
 	int rotating = !!(array->layout & RAIDKM_LAYOUT_ROTATING);
 	int n_added = 0, new_n, froze = 0;
 
-	/* count and sanity-check the new disks */
+	/* The new disks arrive one of two ways:
+	 *   - on the command line: `--add-data <disks>`, or the one-line
+	 *     traditional `--grow --raid-devices=N --add <disks>`.  We add
+	 *     them as spares (step 1 below) before bumping raid_disks.
+	 *   - already present as spares from a prior step: the classic
+	 *     two-step `mdadm --add <disks>` then `mdadm --grow
+	 *     --raid-devices=N`.  The command line then carries no devices and
+	 *     we simply grow into the existing spares. */
 	for (dv = devlist; dv; dv = dv->next)
 		n_added++;
-	if (n_added == 0) {
-		pr_err("raidkm grow: supply the new data disk(s) with --add-data\n");
-		return 1;
-	}
-	new_n = (s->raiddisks > 0) ? s->raiddisks : old_n + n_added;
-	if (new_n != old_n + n_added) {
-		pr_err("raidkm grow: adding %d data disk(s) makes raid-devices %d; --raid-devices=%d disagrees\n",
-		       n_added, old_n + n_added, new_n);
-		return 1;
+
+	if (n_added > 0) {
+		new_n = (s->raiddisks > 0) ? s->raiddisks : old_n + n_added;
+		if (new_n != old_n + n_added) {
+			pr_err("raidkm grow: adding %d data disk(s) makes raid-devices %d; --raid-devices=%d disagrees\n",
+			       n_added, old_n + n_added, new_n);
+			return 1;
+		}
+	} else {
+		/* traditional two-step: consume spares already in the array */
+		int want;
+		if (s->raiddisks <= 0) {
+			pr_err("raidkm grow: supply the new data disk(s) with --add-data, or use --raid-devices=N after adding spares with --add\n");
+			return 1;
+		}
+		new_n = s->raiddisks;
+		want = new_n - old_n;
+		if (want <= 0) {
+			pr_err("raidkm grow: --raid-devices=%d does not grow %s (currently %d disks)\n",
+			       new_n, devname, old_n);
+			return 1;
+		}
+		if (array->spare_disks < want) {
+			pr_err("raidkm grow: growing to %d disks needs %d spare(s) but %s has only %d; add them first with `mdadm %s --add <disks>`\n",
+			       new_n, want, devname, array->spare_disks, devname);
+			return 1;
+		}
 	}
 	if (new_n > RAIDKM_MAX_DISKS) {
 		pr_err("raidkm grow: no more than %d raid-devices supported\n",
@@ -1878,8 +1903,8 @@ static int raidkm_grow_data(char *devname, int fd, struct mddev_dev *devlist,
 
 	if (c->verbose >= 0)
 		pr_err("raidkm grow: %s adding %d data disk(s): k=%d->%d (raid-devices %d->%d, m=%d, %s) via online reshape\n",
-		       devname, n_added, old_k, old_k + n_added, old_n, new_n,
-		       old_m, rotating ? "rotating" : "parity-N");
+		       devname, new_n - old_n, old_k, old_k + (new_n - old_n),
+		       old_n, new_n, old_m, rotating ? "rotating" : "parity-N");
 
 	/* Read sysfs state and FREEZE the array before touching anything:
 	 * adding a spare to a complete array can briefly kick md_check_recovery,
@@ -1898,8 +1923,10 @@ static int raidkm_grow_data(char *devname, int fd, struct mddev_dev *devlist,
 	}
 
 	/* 1. add the new disk(s) as spares (writes spare superblocks +
-	 *    ADD_NEW_DISK); frozen => no spurious recovery is started. */
-	if (Manage_subdevs(devname, fd, devlist, c->verbose, 0, UOPT_UNDEFINED,
+	 *    ADD_NEW_DISK); frozen => no spurious recovery is started.  Skipped
+	 *    in the two-step form, where the spares are already in the array. */
+	if (n_added > 0 &&
+	    Manage_subdevs(devname, fd, devlist, c->verbose, 0, UOPT_UNDEFINED,
 			   c->force)) {
 		pr_err("raidkm grow: failed to add the new disk(s) to %s\n", devname);
 		goto out_unfreeze;

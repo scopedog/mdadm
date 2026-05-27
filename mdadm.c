@@ -1645,15 +1645,28 @@ int main(int argc, char *argv[])
 		break;
 
 	case GROW:
-		/* raidkm parity grow via --add.  For raidkm the only --grow
-		 * "--add" operation is adding parity (data disks are fixed),
-		 * so neither --raid-devices nor --layout is required: the new
-		 * count is the current count plus the added disks, and the new
-		 * m follows (or --layout overrides).  Derive raid_disks here so
-		 * the command reaches Grow_reshape() rather than the spare-add
-		 * path.  (To add a hot spare instead, use MANAGE-mode --add:
-		 * "mdadm /dev/mdN --add <disk>" without --grow.)  An explicit
-		 * --raid-devices still wins. */
+		/* raidkm (level 71) grow disambiguation.  An untagged grow (no
+		 * --add-data/--add-parity) is interpreted like the command the
+		 * user typed:
+		 *   - explicit --raid-devices=N  => traditional capacity grow,
+		 *     i.e. add DATA disk(s) at fixed parity, exactly as growing a
+		 *     stock RAID6 does.  The new disks may be on the command line
+		 *     (--add) or pre-added as spares (the classic two-step form).
+		 *   - bare `--grow --add <disk>` with NO --raid-devices => raidkm
+		 *     shorthand: each added disk becomes one more PARITY.
+		 * An explicit --add-data/--add-parity always wins over this. */
+		if (array.level == LEVEL_RAIDKM &&
+		    s.raidkm_grow == RAIDKM_GROW_UNSET) {
+			if (s.raiddisks > 0)
+				s.raidkm_grow = RAIDKM_GROW_DATA;
+			else if (devs_found > 1)
+				s.raidkm_grow = RAIDKM_GROW_PARITY;
+		}
+		/* Derive raid_disks from the #added disks when not given
+		 * explicitly, so a parity grow reaches Grow_reshape() rather than
+		 * the hot-spare-add path.  (To add a hot spare instead, use
+		 * MANAGE-mode --add: "mdadm /dev/mdN --add <disk>" without
+		 * --grow.) */
 		if (array.level == LEVEL_RAIDKM &&
 		    s.raiddisks == 0 && devs_found > 1)
 			s.raiddisks = array.raid_disks + (devs_found - 1);
