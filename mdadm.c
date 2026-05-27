@@ -227,6 +227,8 @@ int main(int argc, char *argv[])
 		case Add:
 		case AddSpare:
 		case AddJournal:
+		case AddParity:
+		case AddData:
 		case 'r':
 		case Remove:
 		case Replace:
@@ -967,6 +969,22 @@ int main(int argc, char *argv[])
 		case O(GROW,Add):
 		case O(MANAGE,'a'):
 		case O(MANAGE,Add): /* add a drive */
+			devmode = 'a';
+			continue;
+		case O(GROW,AddParity): /* raidkm: added disk(s) become parity */
+		case O(GROW,AddData):   /* raidkm: added disk(s) become data */
+			/* The trailing devices are collected into the devlist
+			 * just like --add; record which raidkm grow this is so
+			 * Grow_reshape() routes to the parity-recreate or the
+			 * online data reshape.  Mutually exclusive. */
+			if (s.raidkm_grow &&
+			    s.raidkm_grow != (opt == AddData ? RAIDKM_GROW_DATA
+							     : RAIDKM_GROW_PARITY)) {
+				pr_err("--add-parity and --add-data are mutually exclusive\n");
+				exit(2);
+			}
+			s.raidkm_grow = (opt == AddData) ? RAIDKM_GROW_DATA
+							 : RAIDKM_GROW_PARITY;
 			devmode = 'a';
 			continue;
 		case O(MANAGE,AddSpare): /* add drive - never re-add */

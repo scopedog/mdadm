@@ -507,6 +507,8 @@ enum special_options {
 	Add,
 	AddSpare,
 	AddJournal,
+	AddParity,	/* raidkm --grow: added disk(s) become parity (offline recreate) */
+	AddData,	/* raidkm --grow: added disk(s) become data (online reshape) */
 	Remove,
 	Fail,
 	Replace,
@@ -707,7 +709,15 @@ struct shape {
 	unsigned long long data_offset;
 	int	consistency_policy;
 	change_dir_t direction;
+	/* raidkm (level 71) --grow sub-operation, set by --add-parity/--add-data.
+	 * 0 = unset (legacy bare `--grow --add` => parity); see RAIDKM_GROW_*. */
+	int	raidkm_grow;
 };
+
+/* values for shape.raidkm_grow */
+#define RAIDKM_GROW_UNSET	0
+#define RAIDKM_GROW_PARITY	1	/* --add-parity: offline grow-via-resync */
+#define RAIDKM_GROW_DATA	2	/* --add-data: online reshape (add data disk) */
 
 /* List of device names - wildcards expanded */
 struct mddev_dev {

@@ -1814,6 +1814,128 @@ error:
 }
 
 /*
+ * raidkm_grow_data() - add data disk(s) to a raidkm (level 71) array, growing
+ * capacity at a FIXED parity count m (k -> k + n_added).
+ *
+ * Unlike adding parity (which is a free append under PARITY_N), adding a data
+ * disk changes the stripe width, so every block relocates -- a true restripe.
+ * That is exactly what the inherited kernel online-reshape engine does
+ * (delta_disks > 0 at fixed max_degraded), and it works for BOTH layouts
+ * (PARITY_N and rotating) because the relocation rides the layout-aware
+ * compute_sector().  The layout is immutable across the grow.
+ *
+ * We drive the kernel reshape with the same primitives reshape_array() uses:
+ *   1. add the new disk(s) as spares via Manage_subdevs() (the --add path);
+ *   2. bump raid_disks via sysfs, which makes the kernel run check_reshape() ->
+ *      start_reshape() -> reshape_request().
+ * A grow needs no backup file: writepos < readpos throughout (the wider new
+ * layout writes behind the narrower old layout's read frontier), so a clean run
+ * never overwrites not-yet-relocated data, and a crash resumes from the
+ * kernel's reshape_position checkpoint.  The reshape runs online in the
+ * background; the array stays readable/writable.
+ *
+ * Called from Grow_reshape() for level-71 arrays when --add-data is given.
+ */
+static int raidkm_grow_data(char *devname, int fd, struct mddev_dev *devlist,
+			    struct context *c, struct shape *s,
+			    struct mdu_array_info_s *array)
+{
+	struct mdinfo *sra = NULL;
+	struct mddev_dev *dv;
+	int old_n = array->raid_disks;
+	int old_m = RAIDKM_LAYOUT_M(array->layout);
+	int old_k = old_n - old_m;
+	int rotating = !!(array->layout & RAIDKM_LAYOUT_ROTATING);
+	int n_added = 0, new_n, froze = 0;
+
+	/* count and sanity-check the new disks */
+	for (dv = devlist; dv; dv = dv->next)
+		n_added++;
+	if (n_added == 0) {
+		pr_err("raidkm grow: supply the new data disk(s) with --add-data\n");
+		return 1;
+	}
+	new_n = (s->raiddisks > 0) ? s->raiddisks : old_n + n_added;
+	if (new_n != old_n + n_added) {
+		pr_err("raidkm grow: adding %d data disk(s) makes raid-devices %d; --raid-devices=%d disagrees\n",
+		       n_added, old_n + n_added, new_n);
+		return 1;
+	}
+	if (new_n > RAIDKM_MAX_DISKS) {
+		pr_err("raidkm grow: no more than %d raid-devices supported\n",
+		       RAIDKM_MAX_DISKS);
+		return 1;
+	}
+	if (s->layout_str) {
+		pr_err("raidkm grow: --layout cannot be combined with --add-data (the layout is immutable)\n");
+		return 1;
+	}
+	if (array->active_disks < old_n) {
+		pr_err("raidkm grow: array is degraded (%d of %d disks present); refusing to grow data\n",
+		       array->active_disks, old_n);
+		return 1;
+	}
+
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: %s adding %d data disk(s): k=%d->%d (raid-devices %d->%d, m=%d, %s) via online reshape\n",
+		       devname, n_added, old_k, old_k + n_added, old_n, new_n,
+		       old_m, rotating ? "rotating" : "parity-N");
+
+	/* Read sysfs state and FREEZE the array before touching anything:
+	 * adding a spare to a complete array can briefly kick md_check_recovery,
+	 * and the immediate raid_disks write would then lose the race with -EBUSY.
+	 * Freezing while idle blocks that; starting the reshape clears it. */
+	sra = sysfs_read(fd, NULL, GET_VERSION | GET_LEVEL | GET_DISKS);
+	if (!sra) {
+		pr_err("raidkm grow: cannot read sysfs state for %s\n", devname);
+		return 1;
+	}
+	froze = sysfs_freeze_array(sra);
+	if (froze < 0) {
+		pr_err("raidkm grow: %s is busy (resync/reshape in progress); retry when idle\n",
+		       devname);
+		goto out;
+	}
+
+	/* 1. add the new disk(s) as spares (writes spare superblocks +
+	 *    ADD_NEW_DISK); frozen => no spurious recovery is started. */
+	if (Manage_subdevs(devname, fd, devlist, c->verbose, 0, UOPT_UNDEFINED,
+			   c->force)) {
+		pr_err("raidkm grow: failed to add the new disk(s) to %s\n", devname);
+		goto out_unfreeze;
+	}
+
+	/* 2. bump raid_disks -> kernel raidkm_check_reshape() setup */
+	if (sysfs_set_num(sra, NULL, "raid_disks", new_n) != 0) {
+		pr_err("raidkm grow: failed to set raid_disks=%d; reshape NOT started\n",
+		       new_n);
+		goto out_unfreeze;
+	}
+
+	/* 3. start the reshape (this also clears the freeze).  A grow needs no
+	 *    backup file: writepos < readpos, so the run never overwrites
+	 *    not-yet-relocated data and a crash resumes from reshape_position. */
+	if (sysfs_set_str(sra, NULL, "sync_action", "reshape") < 0) {
+		pr_err("raidkm grow: failed to start reshape on %s\n", devname);
+		goto out_unfreeze;
+	}
+
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: reshape started on %s; monitor with /proc/mdstat or --detail\n",
+		       devname);
+	sysfs_free(sra);
+	return 0;
+
+out_unfreeze:
+	if (froze > 0)
+		sysfs_set_str(sra, NULL, "sync_action", "idle");
+out:
+	if (sra)
+		sysfs_free(sra);
+	return 1;
+}
+
+/*
  * raidkm_grow_parity() - add parity disk(s) to a raidkm (level 71) array.
  *
  * raidkm keeps data on disks [0, raid_disks - m) and never relocates it
@@ -2127,10 +2249,15 @@ int Grow_reshape(char *devname, int fd,
 		return 1;
 	}
 
-	/* raidkm (level 71) grows parity via stop+recreate+resync, not the
-	 * generic reshape path - it has no kernel online reshape support. */
-	if (array.level == LEVEL_RAIDKM)
+	/* raidkm (level 71): --add-data adds data disk(s) via the kernel online
+	 * reshape; --add-parity (and legacy bare --add) adds parity via the
+	 * offline stop/recreate/resync.  Neither uses the generic raid4/5/6
+	 * reshape path. */
+	if (array.level == LEVEL_RAIDKM) {
+		if (s->raidkm_grow == RAIDKM_GROW_DATA)
+			return raidkm_grow_data(devname, fd, devlist, c, s, &array);
 		return raidkm_grow_parity(devname, fd, devlist, c, s, &array);
+	}
 
 	if (s->level != UnSet && s->chunk) {
 		pr_err("Cannot change array level in the same operation as changing chunk size.\n");
