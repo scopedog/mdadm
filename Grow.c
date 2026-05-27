@@ -1848,19 +1848,6 @@ static int raidkm_grow_data(char *devname, int fd, struct mddev_dev *devlist,
 	int rotating = !!(array->layout & RAIDKM_LAYOUT_ROTATING);
 	int n_added = 0, new_n, froze = 0;
 
-	/*
-	 * TEMPORARILY DISABLED: the online grow-data reshape corrupts
-	 * reconstruction on a degraded array because the kernel does not yet
-	 * rebuild the ISA-L EC matrix/tables for the grown k (clean reads are
-	 * fine; a degraded read decodes from the stale-k matrix).  Refuse here
-	 * with a clear message until the kernel fix lands; the implementation
-	 * below is kept intact (compiled but unreachable) for easy re-enable.
-	 */
-	pr_err("raidkm grow: --add-data (online data-disk grow) is temporarily disabled pending a kernel fix\n"
-	       "    (the EC matrix/tables are not yet rebuilt for the grown geometry, which would corrupt\n"
-	       "     reconstruction on a degraded array).  --add-parity is unaffected.\n");
-	return 1;
-
 	/* count and sanity-check the new disks */
 	for (dv = devlist; dv; dv = dv->next)
 		n_added++;
