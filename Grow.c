@@ -1962,6 +1962,13 @@ out:
 	return 1;
 }
 
+/* defined later; used by the rotating add-parity reshape for its crash-safe
+ * backward data_offset shift. */
+static int set_new_data_offset(struct mdinfo *sra, struct supertype *st,
+			       char *devname, int delta_disks,
+			       unsigned long long data_offset,
+			       unsigned long long min, int can_fallback);
+
 /*
  * raidkm_grow_parity_rotating() - add ONE parity disk (m -> m+1) to a
  * rotating-layout raidkm array via the inherited online reshape.
@@ -1983,11 +1990,13 @@ out:
  *
  * Exactly one parity may be added per reshape.
  *
- * Crash-safety note: this runs at the array's existing data_offset.  A CLEAN
- * run is safe (each logical row stays at the same sector and is fully read
- * before being rewritten, and the new parity member is empty there), but a
- * power loss mid-reshape is not yet crash-safe — that needs a data_offset shift
- * (writepos == readpos here, unlike grow-data). TODO.
+ * Crash safety: because k is fixed, writepos == readpos (the relocation rewrites
+ * each row at its own sector), so unlike grow-data there is no slack.  We
+ * therefore reserve a BACKWARD data_offset shift (one chunk) before starting
+ * (set_new_data_offset with delta_disks=+1): the kernel then reads at the old
+ * offset and writes at the new one (min_offset_diff < 0), so a power loss
+ * resumes from reshape_position with the source data intact.  If the array has
+ * no head-space before data_offset, the grow is refused rather than run unsafe.
  */
 static int raidkm_grow_parity_rotating(char *devname, int fd,
 				       struct mddev_dev *devlist,
@@ -1995,12 +2004,14 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 				       struct mdu_array_info_s *array)
 {
 	struct mdinfo *sra = NULL;
+	struct supertype *st = NULL;
 	int old_n = array->raid_disks;
 	int old_m = RAIDKM_LAYOUT_M(array->layout);
 	int new_m = old_m + 1;
 	int new_n = old_n + 1;
 	int new_layout = (array->layout & ~RAIDKM_LAYOUT_M_MASK) | new_m;
-	int n_added = 0, froze = 0, dfd;
+	unsigned long long min_change;
+	int n_added = 0, froze = 0, dfd, rv = 1;
 	struct mddev_dev *dv;
 
 	for (dv = devlist; dv; dv = dv->next)
@@ -2036,10 +2047,16 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 		pr_err("raidkm grow: %s adding a parity disk: m=%d->%d (raid-devices %d->%d, k=%d, rotating) via online reshape\n",
 		       devname, old_m, new_m, old_n, new_n, old_n - old_m);
 
+	st = super_by_fd(fd, NULL);
+	if (!st) {
+		pr_err("raidkm grow: cannot load metadata handler for %s\n", devname);
+		return 1;
+	}
+
 	sra = sysfs_read(fd, NULL, GET_VERSION | GET_LEVEL | GET_DISKS);
 	if (!sra) {
 		pr_err("raidkm grow: cannot read sysfs state for %s\n", devname);
-		return 1;
+		goto out;
 	}
 	froze = sysfs_freeze_array(sra);
 	if (froze < 0) {
@@ -2054,21 +2071,61 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 		pr_err("raidkm grow: failed to add the new disk to %s\n", devname);
 		goto out_unfreeze;
 	}
-	/* 2. bump raid_disks (delta_disks=+1; layout unchanged here, so the
-	 *    kernel accepts it as a disk-count change and sizes the cache). */
+
+	/* 2. reserve a BACKWARD data_offset shift for crash safety.  add-parity
+	 *    keeps the data-disk count k fixed, so writepos == readpos: without a
+	 *    shift, a clean run is fine but a power loss mid-reshape would have
+	 *    overwritten not-yet-checkpointed source data.  Shifting the new
+	 *    geometry's data_offset down by one chunk makes the kernel read at the
+	 *    old offset and write at the new one (min_offset_diff < 0), so a crash
+	 *    resumes from reshape_position with the source intact.  Passing
+	 *    delta_disks=+1 makes set_new_data_offset choose the decrease direction
+	 *    the kernel demands for a disk-count grow; a fresh re-read carries the
+	 *    just-added spare so it gets a new_offset too. */
+	{
+		struct mdinfo *dsra;
+		char *dbg = getenv("RAIDKM_DBG_OFF_CHUNKS");	/* TEMP diagnostic */
+		int chunks = dbg ? atoi(dbg) : 1;
+
+		if (chunks == 0)
+			goto skip_offset;			/* TEMP: test no-shift */
+		dsra = sysfs_read(fd, NULL,
+			GET_COMPONENT | GET_DEVS | GET_OFFSET | GET_STATE | GET_CHUNK);
+
+		if (!dsra) {
+			pr_err("raidkm grow: cannot re-read sysfs for the data_offset shift on %s\n",
+			       devname);
+			goto out_unfreeze;
+		}
+		min_change = ((unsigned long long)array->chunk_size >> 9) * chunks;
+		if (set_new_data_offset(dsra, st, devname, 1, INVALID_SECTORS,
+					min_change, 0) != 0) {
+			sysfs_free(dsra);
+			pr_err("raidkm grow: cannot reserve a data_offset shift for crash-safe add-parity on %s (insufficient head-space before data, or metadata lacks data_offset support); reshape NOT started\n",
+			       devname);
+			goto out_unfreeze;
+		}
+		sysfs_free(dsra);
+	}
+skip_offset:
+
+	/* 3. bump raid_disks (delta_disks=+1; layout unchanged here, so the
+	 *    kernel accepts it as a disk-count change and sizes the cache.  The
+	 *    backward new_offset set above satisfies its "grow => new_offset <=
+	 *    data_offset" requirement). */
 	if (sysfs_set_num(sra, NULL, "raid_disks", new_n) != 0) {
 		pr_err("raidkm grow: failed to set raid_disks=%d; reshape NOT started\n",
 		       new_n);
 		goto out_unfreeze;
 	}
-	/* 3. set the new layout (m+1, same rotating placement); delta_disks is
+	/* 4. set the new layout (m+1, same rotating placement); delta_disks is
 	 *    still +1, so raidkm_check_reshape recognizes the add-parity. */
 	if (sysfs_set_num(sra, NULL, "layout", new_layout) != 0) {
 		pr_err("raidkm grow: failed to set layout for m=%d; reshape NOT started\n",
 		       new_m);
 		goto out_unfreeze;
 	}
-	/* 4. start the reshape (this also clears the freeze). */
+	/* 5. start the reshape (this also clears the freeze). */
 	if (sysfs_set_str(sra, NULL, "sync_action", "reshape") < 0) {
 		pr_err("raidkm grow: failed to start reshape on %s\n", devname);
 		goto out_unfreeze;
@@ -2077,16 +2134,20 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 	if (c->verbose >= 0)
 		pr_err("raidkm grow: reshape started on %s; monitor with /proc/mdstat or --detail\n",
 		       devname);
-	sysfs_free(sra);
-	return 0;
+	rv = 0;
+	goto out;
 
 out_unfreeze:
 	if (froze > 0)
 		sysfs_set_str(sra, NULL, "sync_action", "idle");
 out:
+	if (st) {
+		st->ss->free_super(st);
+		free(st);
+	}
 	if (sra)
 		sysfs_free(sra);
-	return 1;
+	return rv;
 }
 
 /*
