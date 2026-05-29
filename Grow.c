@@ -1992,12 +1992,16 @@ static int set_new_data_offset(struct mdinfo *sra, struct supertype *st,
  *
  * Crash safety: because k is fixed, writepos == readpos (the relocation rewrites
  * each row at its own sector), so unlike grow-data there is no slack.  We
- * therefore reserve a BACKWARD data_offset shift (one chunk) before starting
+ * therefore reserve a BACKWARD data_offset shift before starting
  * (set_new_data_offset with delta_disks=+1): the kernel then reads at the old
  * offset and writes at the new one (min_offset_diff < 0), so a power loss
- * resumes from reshape_position with the source data intact.  If the array has
- * no head-space before data_offset, the grow is refused rather than run unsafe.
+ * resumes from reshape_position with the source data intact.  The shift must be
+ * strictly greater than 2 chunks for the kernel's reshape_request() per-pass
+ * check (readpos > writepos) to hold; we use 4 chunks for a small margin.  See
+ * RAIDKM_ADDPARITY_SHIFT_CHUNKS.  If the array has no head-space before
+ * data_offset, the grow is refused rather than run unsafe.
  */
+#define RAIDKM_ADDPARITY_SHIFT_CHUNKS 4
 static int raidkm_grow_parity_rotating(char *devname, int fd,
 				       struct mddev_dev *devlist,
 				       struct context *c, struct shape *s,
@@ -2073,22 +2077,20 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 	}
 
 	/* 2. reserve a BACKWARD data_offset shift for crash safety.  add-parity
-	 *    keeps the data-disk count k fixed, so writepos == readpos: without a
-	 *    shift, a clean run is fine but a power loss mid-reshape would have
-	 *    overwritten not-yet-checkpointed source data.  Shifting the new
-	 *    geometry's data_offset down by one chunk makes the kernel read at the
-	 *    old offset and write at the new one (min_offset_diff < 0), so a crash
-	 *    resumes from reshape_position with the source intact.  Passing
-	 *    delta_disks=+1 makes set_new_data_offset choose the decrease direction
-	 *    the kernel demands for a disk-count grow; a fresh re-read carries the
-	 *    just-added spare so it gets a new_offset too. */
+	 *    keeps the data-disk count k fixed, so writepos == readpos and there
+	 *    is no slack: without a shift, a clean run is fine but a power loss
+	 *    mid-reshape would have overwritten not-yet-checkpointed source data.
+	 *    Shift size = RAIDKM_ADDPARITY_SHIFT_CHUNKS chunks; derivation in the
+	 *    kernel's reshape_request() says shift_chunks must be > 2 so that
+	 *    readpos > writepos at every pass (the metadata-flush trigger).  We
+	 *    use 4 (one chunk of margin over the minimum), which costs ~4 chunks
+	 *    of head-space per disk and gives the kernel comfortable slack.
+	 *    Passing delta_disks=+1 makes set_new_data_offset choose the decrease
+	 *    direction the kernel demands for a disk-count grow; a fresh re-read
+	 *    carries the just-added spare so it gets a new_offset too. */
 	{
 		struct mdinfo *dsra;
-		char *dbg = getenv("RAIDKM_DBG_OFF_CHUNKS");	/* TEMP diagnostic */
-		int chunks = dbg ? atoi(dbg) : 1;
 
-		if (chunks == 0)
-			goto skip_offset;			/* TEMP: test no-shift */
 		dsra = sysfs_read(fd, NULL,
 			GET_COMPONENT | GET_DEVS | GET_OFFSET | GET_STATE | GET_CHUNK);
 
@@ -2097,7 +2099,8 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 			       devname);
 			goto out_unfreeze;
 		}
-		min_change = ((unsigned long long)array->chunk_size >> 9) * chunks;
+		min_change = ((unsigned long long)array->chunk_size >> 9)
+			     * RAIDKM_ADDPARITY_SHIFT_CHUNKS;
 		if (set_new_data_offset(dsra, st, devname, 1, INVALID_SECTORS,
 					min_change, 0) != 0) {
 			sysfs_free(dsra);
@@ -2107,7 +2110,6 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 		}
 		sysfs_free(dsra);
 	}
-skip_offset:
 
 	/* 3. bump raid_disks (delta_disks=+1; layout unchanged here, so the
 	 *    kernel accepts it as a disk-count change and sizes the cache.  The
