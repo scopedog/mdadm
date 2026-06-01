@@ -2002,58 +2002,160 @@ static int set_new_data_offset(struct mdinfo *sra, struct supertype *st,
  * data_offset, the grow is refused rather than run unsafe.
  */
 #define RAIDKM_ADDPARITY_SHIFT_CHUNKS 4
-/*
- * Stream `bytes` from in_fd to out_fd (both positioned at 0), then fsync the
- * destination.  Used to save the array's logical content to the backup file
- * and to restore it afterward.  Returns 0 on success.
- */
-#define RAIDKM_MIGRATE_BUFSZ (4 * 1024 * 1024)
-static int raidkm_copy_fd(int in_fd, int out_fd, unsigned long long bytes,
-			  const char *what, int verbose)
+/* Backup-window budget for the offline rotating add-parity relocation.  Each
+ * batch's old member content is copied here before the batch is relocated, so
+ * a crash mid-batch can be rolled back.  Bounded (NOT the whole array). */
+#define RAIDKM_RELOC_WINDOW_BYTES (64ULL * 1024 * 1024)
+
+static void raidkm_migrate_marker(const char *bf, const char *contents);
+
+/* pread/pwrite that loop until the whole buffer is transferred. */
+static int raidkm_pread_full(int fd, void *buf, size_t len, off_t off)
 {
-	char *buf = xmalloc(RAIDKM_MIGRATE_BUFSZ);
-	unsigned long long done = 0;
-	int rv = 1;
-
-	if (lseek(in_fd, 0, SEEK_SET) != 0 || lseek(out_fd, 0, SEEK_SET) != 0) {
-		pr_err("raidkm grow: %s: seek failed: %s\n", what, strerror(errno));
-		goto out;
+	size_t done = 0;
+	while (done < len) {
+		ssize_t r = pread(fd, (char *)buf + done, len - done, off + done);
+		if (r <= 0)
+			return -1;
+		done += r;
 	}
-	while (done < bytes) {
-		unsigned long long want = bytes - done;
-		ssize_t r, off;
+	return 0;
+}
+static int raidkm_pwrite_full(int fd, const void *buf, size_t len, off_t off)
+{
+	size_t done = 0;
+	while (done < len) {
+		ssize_t w = pwrite(fd, (const char *)buf + done, len - done, off + done);
+		if (w <= 0)
+			return -1;
+		done += w;
+	}
+	return 0;
+}
 
-		if (want > RAIDKM_MIGRATE_BUFSZ)
-			want = RAIDKM_MIGRATE_BUFSZ;
-		r = read(in_fd, buf, want);
-		if (r <= 0) {
-			pr_err("raidkm grow: %s: read at %llu failed: %s\n",
-			       what, done, r ? strerror(errno) : "short read");
+/*
+ * raidkm rotating layout: which physical disk holds logical data index d
+ * (0..k-1) of row s, for n disks with m parity.  Mirrors the rotating branch
+ * of the kernel's raid5_compute_sector():
+ *     pd_idx = n - 1 - (s mod n);  disk = (pd_idx + m + d) mod n.
+ */
+static int raidkm_rot_data_disk(unsigned long long s, int n, int m, int d)
+{
+	int pd_idx = (n - 1) - (int)(s % (unsigned int)n);
+	return (pd_idx + m + d) % n;
+}
+
+/*
+ * Offline DATA relocation for rotating add-parity (m -> m+1).  The array is
+ * already stopped; fds[0..old_n-1] are the existing members in role order and
+ * fds[old_n] is the freshly added disk, all open O_RDWR.
+ *
+ * Because the data-disk count k is unchanged, every logical row keeps its
+ * per-disk offset (data_offset + s*spc); only which disk holds each data block
+ * rotates (and one new disk joins).  So each row is an independent disk-
+ * permutation at a fixed offset, and the whole job windows trivially.  We move
+ * only DATA blocks; parity is recomputed by the resync after the recreate.
+ *
+ * Each batch (<= RAIDKM_RELOC_WINDOW_BYTES of old content) is copied to the
+ * backup file first, so an interrupted batch can be rolled back and re-run
+ * (a .raidkm-migrate marker records the in-flight range).  Returns 0 on success.
+ */
+static int raidkm_relocate_rotating(int *fds, int old_n, int old_m, int new_m,
+				    int k, unsigned long long data_offset,
+				    unsigned int spc, unsigned long long rows,
+				    const char *bf, int verbose)
+{
+	int new_n = old_n + 1;
+	size_t chunk = (size_t)spc * 512;
+	unsigned long long rows_per_batch, b, s;
+	char **buf = NULL, *bbuf = NULL, marker[256];
+	int rv = 1, d, i;
+
+	rows_per_batch = RAIDKM_RELOC_WINDOW_BYTES / ((unsigned long long)chunk * old_n);
+	if (rows_per_batch == 0)
+		rows_per_batch = 1;
+
+	buf = xcalloc(k, sizeof(*buf));
+	for (d = 0; d < k; d++)
+		buf[d] = xmalloc(chunk);
+	bbuf = xmalloc(chunk);
+
+	for (b = 0; b < rows; b += rows_per_batch) {
+		unsigned long long blo = b, bhi = b + rows_per_batch;
+		int bfd;
+
+		if (bhi > rows)
+			bhi = rows;
+
+		/* 1. back up this batch's old content (all old members) */
+		bfd = open(bf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		if (bfd < 0) {
+			pr_err("raidkm grow: cannot open backup file %s: %s\n",
+			       bf, strerror(errno));
 			goto out;
 		}
-		for (off = 0; off < r; ) {
-			ssize_t w = write(out_fd, buf + off, r - off);
-			if (w <= 0) {
-				pr_err("raidkm grow: %s: write at %llu failed: %s\n",
-				       what, done + (unsigned long long)off,
-				       strerror(errno));
-				goto out;
+		for (i = 0; i < old_n; i++)
+			for (s = blo; s < bhi; s++) {
+				off_t off = (off_t)(data_offset + s * spc) * 512;
+
+				if (raidkm_pread_full(fds[i], bbuf, chunk, off) ||
+				    raidkm_pwrite_full(bfd, bbuf, chunk,
+					(off_t)((i * (bhi - blo)) + (s - blo)) * chunk)) {
+					pr_err("raidkm grow: backup of batch [%llu,%llu) failed: %s\n",
+					       blo, bhi, strerror(errno));
+					close(bfd);
+					goto out;
+				}
 			}
-			off += w;
+		if (fsync(bfd) != 0) {
+			pr_err("raidkm grow: backup fsync failed: %s\n", strerror(errno));
+			close(bfd);
+			goto out;
 		}
-		done += r;
-		if (verbose > 0 &&
-		    (done % (256ULL << 20)) < RAIDKM_MIGRATE_BUFSZ)
-			pr_err("raidkm grow: %s: %llu/%llu MiB\n",
-			       what, done >> 20, bytes >> 20);
-	}
-	if (fsync(out_fd) != 0) {
-		pr_err("raidkm grow: %s: fsync failed: %s\n", what, strerror(errno));
-		goto out;
+		close(bfd);
+		snprintf(marker, sizeof(marker),
+			 "raidkm rotating add-parity relocating rows [%llu,%llu) of %llu\n"
+			 "old content of this batch is in the backup file.\n",
+			 blo, bhi, rows);
+		raidkm_migrate_marker(bf, marker);
+
+		/* 2. relocate each row: read its k data blocks from the old slots,
+		 *    write them to the new slots (same offset). */
+		for (s = blo; s < bhi; s++) {
+			off_t off = (off_t)(data_offset + s * spc) * 512;
+
+			for (d = 0; d < k; d++) {
+				int od = raidkm_rot_data_disk(s, old_n, old_m, d);
+
+				if (raidkm_pread_full(fds[od], buf[d], chunk, off)) {
+					pr_err("raidkm grow: read row %llu d%d (disk %d) failed: %s\n",
+					       s, d, od, strerror(errno));
+					goto out;
+				}
+			}
+			for (d = 0; d < k; d++) {
+				int ndsk = raidkm_rot_data_disk(s, new_n, new_m, d);
+
+				if (raidkm_pwrite_full(fds[ndsk], buf[d], chunk, off)) {
+					pr_err("raidkm grow: write row %llu d%d (disk %d) failed: %s\n",
+					       s, d, ndsk, strerror(errno));
+					goto out;
+				}
+			}
+		}
+		for (i = 0; i < new_n; i++)
+			fsync(fds[i]);
+		if (verbose > 0)
+			pr_err("raidkm grow: relocated rows %llu/%llu\n", bhi, rows);
 	}
 	rv = 0;
 out:
-	free(buf);
+	if (buf) {
+		for (d = 0; d < k; d++)
+			free(buf[d]);
+		free(buf);
+	}
+	free(bbuf);
 	return rv;
 }
 
@@ -2087,29 +2189,31 @@ static void raidkm_migrate_marker(const char *bf, const char *contents)
  * raidkm_grow_parity_rotating() - add ONE parity disk (m -> m+1) to a
  * rotating-layout raidkm array, OUT OF PLACE.
  *
- * A rotating reshape relocates every block.  Doing that in place (the old
- * approach) overwrites old on-disk locations that delayed reads can still
- * target, causing silent, scrub-clean corruption under concurrent I/O (the
- * read/write location-aliasing race; confirmed by instrumentation).  Instead
- * we stage the entire logical content through a backup file so no in-place
- * relocation ever happens:
+ * A rotating reshape relocates every block.  Doing that IN PLACE (the
+ * withdrawn online reshape) overwrote old on-disk locations that delayed reads
+ * could still target, causing silent, scrub-clean corruption under concurrent
+ * I/O (the read/write location-aliasing race; confirmed by instrumentation).
  *
- *   1. SAVE    - read the whole array (old layout, online, pure reads) into
- *                the backup file, then fsync it;
- *   2. STOP    - stop the array;
- *   3. RECREATE- create at the new geometry (m+1, rotating, +1 disk, same
- *                data_offset/uuid/name, --assume-clean: no resync, we are
- *                about to overwrite everything);
- *   4. RESTORE - write the backup file back through the array; the kernel
- *                lays each block out in the new rotation and computes parity
- *                via normal writes.
+ * Instead we relocate OFFLINE and windowed.  Because the data-disk count k is
+ * unchanged, every logical row keeps its per-disk offset; only the disk that
+ * holds each data block rotates (and one new disk joins).  So each row is an
+ * independent disk-permutation at a fixed offset, and the job needs only a
+ * BOUNDED backup window (not the whole array):
  *
- * No block is ever read from a location another write is concurrently
- * overwriting, so the aliasing race is structurally impossible.  The backup
- * file is the crash-recovery source across the stop/recreate/restore window
- * (a marker sidecar flags an interrupted run; the data is preserved in the
- * file).  Requires --backup-file with free space >= the array size, and the
- * array must be idle (no concurrent writes) for the duration.
+ *   1. STOP the array, then relocate the DATA blocks on the raw members
+ *      (raidkm_relocate_rotating): per <=64MiB batch, back up the batch's old
+ *      content to --backup-file (crash rollback), then move each row's data
+ *      from its old rotating slots to its new ones at the same offset;
+ *   2. RECREATE at the new geometry (m+1, rotating, +1 disk, same data_offset/
+ *      uuid/name) WITHOUT --assume-clean, so md's resync recomputes all parity
+ *      from the relocated data.
+ *
+ * No block is ever read from a location concurrently being overwritten (the
+ * array is offline; within a row we read all data before writing), so the
+ * aliasing race is structurally impossible.  Each batch's old content is in
+ * the backup file (a .raidkm-migrate marker flags an interrupted batch) so a
+ * crash can be rolled back.  Requires --backup-file (bounded window of free
+ * space, not array-sized) and an idle array (it is stopped for the operation).
  */
 static int raidkm_grow_parity_rotating(char *devname, int fd,
 				       struct mddev_dev *devlist,
@@ -2124,7 +2228,6 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 	struct mddev_dev *complist = NULL, **tail = &complist, *dv, *nd;
 	char *paths[RAIDKM_MAX_DISKS];
 	unsigned long long data_offset = INVALID_SECTORS;
-	unsigned long long array_bytes = 0;
 	int old_n = array->raid_disks;
 	int old_m = RAIDKM_LAYOUT_M(array->layout);
 	int new_m = old_m + 1;
@@ -2133,7 +2236,7 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 	int n_added = 0, dfd, rv = 1, i;
 	int uuid[4], uuid_set = 0;
 	char name[33] = "";
-	char mdesc[16], marker[512];
+	char mdesc[16];
 	const char *bf = c->backup_file;
 
 	for (i = 0; i < RAIDKM_MAX_DISKS; i++)
@@ -2166,7 +2269,7 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 		return 1;
 	}
 	if (!bf) {
-		pr_err("raidkm grow: rotating add-parity stages the array through a backup file to avoid in-place corruption; supply --backup-file=<path> on a filesystem with free space >= the array size.\n");
+		pr_err("raidkm grow: rotating add-parity relocates data out-of-place windowed through a backup file (crash recovery); supply --backup-file=<path> with a little free space (a bounded window, not the array size).\n");
 		return 1;
 	}
 	dfd = dev_open(devlist->devname, O_RDONLY | O_EXCL);
@@ -2176,11 +2279,6 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 		return 1;
 	}
 	close(dfd);
-
-	if (get_dev_size(fd, devname, &array_bytes) == 0 || array_bytes == 0) {
-		pr_err("raidkm grow: cannot determine array size of %s\n", devname);
-		return 1;
-	}
 
 	/* --- capture live geometry (member paths in role order, offset, id) --- */
 	sra = sysfs_read(fd, NULL, GET_DEVS | GET_OFFSET | GET_STATE | GET_COMPONENT);
@@ -2245,44 +2343,61 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 	}
 
 	if (c->verbose >= 0)
-		pr_err("raidkm grow: %s rotating add-parity m=%d->%d (raid-devices %d->%d, k=%d) out-of-place via %s (%llu MiB)\n",
-		       devname, old_m, new_m, old_n, new_n, k, bf, array_bytes >> 20);
+		pr_err("raidkm grow: %s rotating add-parity m=%d->%d (raid-devices %d->%d, k=%d) out-of-place, windowed via %s\n",
+		       devname, old_m, new_m, old_n, new_n, k, bf);
 
-	/* --- 1. SAVE: stream the whole array into the backup file --- */
-	{
-		int bfd = open(bf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-
-		if (bfd < 0) {
-			pr_err("raidkm grow: cannot create backup file %s: %s\n",
-			       bf, strerror(errno));
-			goto out;
-		}
-		if (c->verbose >= 0)
-			pr_err("raidkm grow: saving array data to %s ...\n", bf);
-		if (raidkm_copy_fd(fd, bfd, array_bytes, "save", c->verbose)) {
-			close(bfd);
-			goto out;
-		}
-		close(bfd);
-	}
-	/* mark restore-pending: from here until restore completes, the only
-	 * complete copy of the data is the backup file. */
-	snprintf(marker, sizeof(marker),
-		 "raidkm rotating add-parity in progress\n"
-		 "array=%s m=%d->%d raid-devices=%d->%d bytes=%llu\n"
-		 "restore: recreate at the new geometry, then write %s back to it.\n",
-		 devname, old_m, new_m, old_n, new_n, array_bytes, bf);
-	raidkm_migrate_marker(bf, marker);
-
-	/* --- 2. STOP (fd is invalid afterwards) --- */
+	/* --- 1. STOP the array, then relocate DATA on the raw members --- */
 	if (Manage_stop(devname, fd, c->verbose, 0)) {
-		pr_err("raidkm grow: failed to stop %s; array NOT modified (data saved in %s)\n",
-		       devname, bf);
+		pr_err("raidkm grow: failed to stop %s; array NOT modified\n", devname);
 		goto out;
 	}
+	{
+		unsigned int spc = array->chunk_size / 512;	/* sectors/chunk */
+		unsigned long long rows;
+		int fds[RAIDKM_MAX_DISKS];
+		int ok = 1, j;
 
-	/* --- 3. RECREATE at the new geometry (assume-clean: restore overwrites
-	 *        everything, so an initial resync would be wasted). --- */
+		if (spc == 0 || sra->component_size == 0) {
+			pr_err("raidkm grow: bad chunk/component geometry\n");
+			goto out;
+		}
+		rows = sra->component_size / spc;
+
+		for (j = 0; j < new_n; j++)
+			fds[j] = -1;
+		for (j = 0; j < old_n; j++) {
+			fds[j] = open(paths[j], O_RDWR);
+			if (fds[j] < 0) {
+				pr_err("raidkm grow: cannot open member %s: %s\n",
+				       paths[j], strerror(errno));
+				ok = 0;
+				break;
+			}
+		}
+		if (ok) {
+			fds[old_n] = open(devlist->devname, O_RDWR);
+			if (fds[old_n] < 0) {
+				pr_err("raidkm grow: cannot open new disk %s: %s\n",
+				       devlist->devname, strerror(errno));
+				ok = 0;
+			}
+		}
+		if (ok && c->verbose >= 0)
+			pr_err("raidkm grow: relocating %s data (k=%d, %llu rows) for rotating m=%d->%d via %s ...\n",
+			       devname, k, rows, old_m, new_m, bf);
+		if (ok && raidkm_relocate_rotating(fds, old_n, old_m, new_m, k,
+						   data_offset, spc, rows, bf,
+						   c->verbose))
+			ok = 0;
+		for (j = 0; j < new_n; j++)
+			if (fds[j] >= 0)
+				close(fds[j]);
+		if (!ok)
+			goto out;	/* data still in old layout; batch backup on disk */
+	}
+
+	/* --- 2. RECREATE at the new geometry; the data is already relocated, so
+	 *        a normal resync (NOT assume-clean) recomputes parity from it. --- */
 	for (i = 0; i < old_n; i++) {
 		nd = xcalloc(1, sizeof(*nd));
 		nd->devname = paths[i];
@@ -2319,7 +2434,7 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 	news.chunk = array->chunk_size / 1024;	/* KiB */
 	news.size = sra->component_size / 2;	/* KiB */
 	news.data_offset = data_offset;
-	news.assume_clean = 1;			/* restore writes data + parity */
+	news.assume_clean = 0;			/* resync recomputes parity from data */
 	news.btype = BitmapNone;
 	news.bitmap_chunk = UnSet;
 	news.consistency_policy = CONSISTENCY_POLICY_UNKNOWN;
@@ -2330,45 +2445,15 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 	cc.backup_file = NULL;	/* Create() must not touch our data backup */
 
 	if (Create(nst, &ident, new_n, complist, &news, &cc)) {
-		pr_err("raidkm grow: recreate at m=%d FAILED; the array data is preserved in %s — recreate the array and write it back.\n",
-		       new_m, bf);
+		pr_err("raidkm grow: recreate at m=%d FAILED after relocation on %s\n",
+		       new_m, devname);
 		goto out;
 	}
 
-	/* --- 4. RESTORE: write the backup file back through the new array.
-	 *        Plain open() (buffered): dev_open() forces O_DIRECT, which needs
-	 *        page-aligned buffers and block-aligned lengths; buffered I/O is
-	 *        simpler here and we fsync at the end. --- */
-	dfd = open(devname, O_RDWR);
-	if (dfd < 0) {
-		pr_err("raidkm grow: cannot open recreated %s to restore data: %s (data preserved in %s)\n",
-		       devname, strerror(errno), bf);
-		goto out;
-	}
-	if (c->verbose >= 0)
-		pr_err("raidkm grow: restoring array data from %s ...\n", bf);
-	{
-		int bfd = open(bf, O_RDONLY);
-
-		if (bfd < 0) {
-			pr_err("raidkm grow: cannot reopen backup file %s: %s\n",
-			       bf, strerror(errno));
-			close(dfd);
-			goto out;
-		}
-		if (raidkm_copy_fd(bfd, dfd, array_bytes, "restore", c->verbose)) {
-			close(bfd);
-			close(dfd);
-			goto out;
-		}
-		close(bfd);
-	}
-	close(dfd);
-
-	/* restore complete and durable: clear the marker. */
+	/* relocation + recreate succeeded: clear the in-flight backup marker. */
 	raidkm_migrate_marker(bf, NULL);
 	if (c->verbose >= 0)
-		pr_err("raidkm grow: %s now m=%d rotating; data restored and parity rebuilt out-of-place (no in-place relocation).\n",
+		pr_err("raidkm grow: %s now m=%d rotating; data relocated out-of-place (windowed), parity rebuilt by resync.\n",
 		       devname, new_m);
 	rv = 0;
 
