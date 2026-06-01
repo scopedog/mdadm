@@ -576,12 +576,19 @@ int Detail(char *dev, struct context *c)
 			print_r10_layout(array.layout);
 			printf("\n");
 		}
+		if (array.level == LEVEL_RAIDKM) {
+			printf("            Layout : m=%d (parity disks), %s\n",
+			       RAIDKM_LAYOUT_M(array.layout),
+			       (array.layout & RAIDKM_LAYOUT_ROTATING) ?
+			       "rotating" : "parity-N");
+		}
 		switch (array.level) {
 		case 0:
 		case 4:
 		case 5:
 		case 10:
 		case 6:
+		case LEVEL_RAIDKM:
 			if (array.chunk_size)
 				printf("        Chunk Size : %dK\n\n",
 				       array.chunk_size/1024);
