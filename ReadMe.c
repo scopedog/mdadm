@@ -127,6 +127,8 @@ struct option long_options[] = {
 	{"level", 1, 0, 'l'}, /* 0, 1, 4, 5, 6, linear */
 	{"parity", 1, 0, Layout}, /* {left,right}-{a,}symmetric */
 	{"layout", 1, 0, Layout},
+	{"parity-count", 1, 0, ParityCount}, /* raidkm: number of parity disks (m) */
+	{"parities", 1, 0, ParityCount},     /* raidkm: alias for --parity-count */
 	{"raid-disks", 1, 0, 'n'},
 	{"raid-devices", 1, 0, 'n'},
 	{"spare-disks", 1, 0, 'x'},
@@ -316,7 +318,9 @@ char Help_create[] =
 "  --rounding=           : rounding factor for linear array (==chunk size)\n"
 "  --level=           -l : raid level: 0,1,4,5,6,10,linear,multipath and synonyms\n"
 "  --parity=          -p : raid5/6 parity algorithm: {left,right}-{,a}symmetric\n"
-"  --layout=             : same as --parity, for RAID10: [fno]NN\n"
+"  --layout=             : same as --parity, for RAID10: [fno]NN,\n"
+"                          for raidkm: rotating (default) or parity-last\n"
+"  --parity-count=        : raidkm: number of parity disks (m); default 2\n"
 "  --raid-devices=    -n : number of active devices in array\n"
 "  --spare-devices=   -x : number of spare (eXtra) devices in initial array\n"
 "  --size=            -z : Size (in K) of each drive in RAID1/4/5/6/10 - optional\n"

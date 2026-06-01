@@ -88,9 +88,11 @@ int default_layout(struct supertype *st, int level, int verbose)
 		layout_map = r5layout;
 		break;
 	case LEVEL_RAIDKM:
-		/* layout carries m; default to 2 parity disks */
-		layout = RAIDKM_MIN_M;
-		layout_name = "m=2";
+		/* layout packs m (low byte) + placement bit; default m=2,
+		 * rotating.  Create() normally composes this from --parity-count
+		 * / --layout before reaching here, so this is just the fallback. */
+		layout = RAIDKM_MIN_M | RAIDKM_LAYOUT_ROTATING;
+		layout_name = "rotating, m=2";
 		break;
 	case LEVEL_FAULTY:
 		layout_map = faultylayout;
@@ -564,14 +566,18 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 		return 1;
 	}
 	if (s->level == LEVEL_RAIDKM) {
-		int m = (s->layout == UnSet) ? RAIDKM_MIN_M
-					     : RAIDKM_LAYOUT_M(s->layout);
+		/* Compose the packed layout the kernel/superblock expect from the
+		 * separately-specified count and placement.  Defaults: m=2 parity
+		 * disks, rotating placement (parity spread across all members). */
+		int rotating = (s->raidkm_rotating != UnSet) ? s->raidkm_rotating : 1;
+		int m = (s->parity_count != UnSet) ? s->parity_count : RAIDKM_MIN_M;
 
 		if (m < RAIDKM_MIN_M || m > RAIDKM_MAX_M) {
-			pr_err("raidkm requires m (parity disks) between %d and %d (set via --layout)\n",
+			pr_err("raidkm requires m (parity disks) between %d and %d (set via --parity-count)\n",
 			       RAIDKM_MIN_M, RAIDKM_MAX_M);
 			return 1;
 		}
+		s->layout = m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0);
 		if (s->raiddisks <= m) {
 			pr_err("raidkm needs at least %d raid-devices for m=%d (one or more data disks plus %d parity)\n",
 			       m + 1, m, m);

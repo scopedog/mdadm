@@ -2025,6 +2025,11 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 		       n_added);
 		return 1;
 	}
+	if (s->parity_count != UnSet && s->parity_count != new_m) {
+		pr_err("raidkm grow: rotating add-parity raises m by one (%d->%d); --parity-count=%d disagrees\n",
+		       old_m, new_m, s->parity_count);
+		return 1;
+	}
 	if (new_m > RAIDKM_MAX_M) {
 		pr_err("raidkm grow: m=%d is already the maximum parity count\n", old_m);
 		return 1;
@@ -2231,15 +2236,20 @@ static int raidkm_grow_parity(char *devname, int fd,
 
 	k = old_n - old_m;			/* data disks - unchanged */
 
-	/* new m: explicit --layout if given, else implied by #added disks */
-	if (s->layout_str) {
+	/* new m: --parity-count if given (preferred), else the deprecated
+	 * numeric --layout, else implied by the number of disks added. */
+	if (s->parity_count != UnSet) {
+		new_m = s->parity_count;
+	} else if (s->layout_str) {
 		new_m = strtol(s->layout_str, &endp, 10);
 		if (!endp || *endp || new_m < RAIDKM_MIN_M ||
 		    new_m > RAIDKM_MAX_M) {
-			pr_err("raidkm grow: --layout must be an integer m in [%d,%d]\n",
+			pr_err("raidkm grow: set the new parity count with --parity-count=N (in [%d,%d]); numeric --layout is deprecated\n",
 			       RAIDKM_MIN_M, RAIDKM_MAX_M);
 			return 1;
 		}
+		pr_err("warning: numeric --layout for raidkm grow is deprecated; use --parity-count=%d\n",
+		       new_m);
 	} else {
 		new_m = old_m + n_added;	/* bare --add: +1 parity per disk */
 	}
@@ -2390,7 +2400,13 @@ static int raidkm_grow_parity(char *devname, int fd,
 	memset(&news, 0, sizeof(news));
 	news.level = LEVEL_RAIDKM;
 	news.raiddisks = new_n;
-	news.layout = new_m;			/* raidkm: layout == m */
+	/* Create() composes the packed layout from parity_count + raidkm_rotating;
+	 * feed it the new m and the (unchanged) placement.  This recreate path is
+	 * reached only for PARITY_N (rotating add-parity is an online reshape), so
+	 * the rotating bit is preserved straight from the original layout. */
+	news.parity_count = new_m;
+	news.raidkm_rotating = (array->layout & RAIDKM_LAYOUT_ROTATING) ? 1 : 0;
+	news.layout = new_m | (array->layout & RAIDKM_LAYOUT_ROTATING);
 	news.chunk = array->chunk_size / 1024;	/* KiB */
 	news.size = sra->component_size / 2;	/* KiB (sectors/2) */
 	news.data_offset = data_offset;		/* sectors - keep data aligned */

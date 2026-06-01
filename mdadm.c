@@ -112,6 +112,8 @@ int main(int argc, char *argv[])
 		.journaldisks	= 0,
 		.level		= UnSet,
 		.layout		= UnSet,
+		.parity_count	= UnSet,
+		.raidkm_rotating = UnSet,
 		.bitmap_chunk	= UnSet,
 		.consistency_policy	= CONSISTENCY_POLICY_UNKNOWN,
 		.data_offset = INVALID_SECTORS,
@@ -616,39 +618,74 @@ int main(int argc, char *argv[])
 				}
 				break;
 			case LEVEL_RAIDKM: {
-				/* raidkm overloads layout: low byte carries m
-				 * (parity disks, Reed-Solomon); an optional 'r'
-				 * suffix (or "-rotating") sets the rotating-parity
-				 * bit.  Plain "N" is PARITY_N (the default).
+				/* raidkm: --layout names the PLACEMENT only.
+				 *   rotating  -> parity rotates across all disks
+				 *                (the default if --layout is omitted)
+				 *   parity-last (aka dedicated/fixed/parity-n)
+				 *             -> parity pinned to the tail m disks
+				 * The parity-disk count m comes from --parity-count.
+				 *
+				 * DEPRECATED back-compat: a bare integer "N" (or "Nr"/
+				 * "N-rotating") still works — the old packed form that
+				 * set both m and placement at once — with a warning.
+				 * Plain "N" stays PARITY_N as it always did (so old
+				 * scripts keep their layout), distinct from the new
+				 * omit-layout default of rotating.
 				 */
 				char buf[32];
-				int rotating = 0;
 				size_t n = strlen(optarg);
 
-				if (n && (optarg[n-1] == 'r' || optarg[n-1] == 'R')) {
-					rotating = 1;
-					n--;
-				} else if (n > 9 &&
-					   strcasecmp(optarg + n - 9, "-rotating") == 0) {
-					rotating = 1;
-					n -= 9;
-				}
-				if (n == 0 || n >= sizeof(buf)) {
-					pr_err("layout for raidkm must be an integer m in [%d,%d], optionally with an 'r' suffix for rotating parity, not %s\n",
-						RAIDKM_MIN_M, RAIDKM_MAX_M, optarg);
+				if (s.raidkm_rotating != UnSet) {
+					pr_err("layout may only be sent once.  Second value was %s\n", optarg);
 					exit(2);
 				}
-				memcpy(buf, optarg, n);
-				buf[n] = '\0';
-				if (parse_num(&s.layout, buf) != 0 ||
-				    s.layout < RAIDKM_MIN_M ||
-				    s.layout > RAIDKM_MAX_M) {
-					pr_err("layout for raidkm must be an integer m (number of parity disks) between %d and %d, optionally with an 'r' suffix, not %s\n",
-						RAIDKM_MIN_M, RAIDKM_MAX_M, optarg);
-					exit(2);
+				if (strcasecmp(optarg, "rotating") == 0 ||
+				    strcasecmp(optarg, "rotate") == 0) {
+					s.raidkm_rotating = 1;
+					break;
 				}
-				if (rotating)
-					s.layout |= RAIDKM_LAYOUT_ROTATING;
+				if (strcasecmp(optarg, "parity-last") == 0 ||
+				    strcasecmp(optarg, "parity-n") == 0 ||
+				    strcasecmp(optarg, "dedicated") == 0 ||
+				    strcasecmp(optarg, "fixed") == 0) {
+					s.raidkm_rotating = 0;
+					break;
+				}
+				/* legacy numeric "N" / "Nr" / "N-rotating" */
+				{
+					int rotating = 0, m;
+
+					if (n && (optarg[n-1] == 'r' ||
+						  optarg[n-1] == 'R')) {
+						rotating = 1;
+						n--;
+					} else if (n > 9 &&
+						   strcasecmp(optarg + n - 9,
+							      "-rotating") == 0) {
+						rotating = 1;
+						n -= 9;
+					}
+					if (n == 0 || n >= sizeof(buf) ||
+					    (memcpy(buf, optarg, n), buf[n] = '\0',
+					     parse_num(&m, buf) != 0) ||
+					    m < RAIDKM_MIN_M || m > RAIDKM_MAX_M) {
+						pr_err("layout for raidkm must be 'rotating' or 'parity-last'; set the parity count with --parity-count, not %s\n",
+							optarg);
+						exit(2);
+					}
+					pr_err("warning: numeric --layout=%s for raidkm is deprecated; use --layout=%s --parity-count=%d\n",
+						optarg,
+						rotating ? "rotating" : "parity-last",
+						m);
+					if (s.parity_count != UnSet &&
+					    s.parity_count != m) {
+						pr_err("--layout=%s implies m=%d but --parity-count=%d was also given\n",
+							optarg, m, s.parity_count);
+						exit(2);
+					}
+					s.parity_count = m;
+					s.raidkm_rotating = rotating;
+				}
 				break;
 			}
 			case LEVEL_FAULTY:
@@ -662,6 +699,21 @@ int main(int argc, char *argv[])
 					exit(2);
 				}
 				break;
+			}
+			continue;
+
+		case O(CREATE,ParityCount):
+		case O(GROW,ParityCount): /* raidkm: number of parity disks (m) */
+			if (s.parity_count != UnSet) {
+				pr_err("--parity-count may only be given once.\n");
+				exit(2);
+			}
+			if (parse_num(&s.parity_count, optarg) != 0 ||
+			    s.parity_count < RAIDKM_MIN_M ||
+			    s.parity_count > RAIDKM_MAX_M) {
+				pr_err("--parity-count must be an integer between %d and %d (number of parity disks), not %s\n",
+					RAIDKM_MIN_M, RAIDKM_MAX_M, optarg);
+				exit(2);
 			}
 			continue;
 

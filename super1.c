@@ -547,9 +547,9 @@ static void examine_super1(struct supertype *st, char *homehost)
 	}
 	if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM) {
 		unsigned int rkl = __le32_to_cpu(sb->layout);
-		printf("         Layout : m=%d (parity disks), %s\n",
-		       RAIDKM_LAYOUT_M(rkl),
-		       (rkl & RAIDKM_LAYOUT_ROTATING) ? "rotating" : "parity-N");
+		printf("         Layout : %s\n",
+		       (rkl & RAIDKM_LAYOUT_ROTATING) ? "rotating" : "parity-last");
+		printf("   Parity Count : %d\n", RAIDKM_LAYOUT_M(rkl));
 	}
 	switch(__le32_to_cpu(sb->level)) {
 	case 0:

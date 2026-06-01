@@ -521,6 +521,7 @@ enum special_options {
 	FailFast,
 	NoFailFast,
 	Layout,
+	ParityCount,	/* raidkm: number of parity disks (m); replaces packing m into --layout */
 	Auto,
 	Force,
 	SuperMinor,
@@ -699,6 +700,11 @@ struct shape {
 	int	level;
 	int	layout;
 	char	*layout_str;
+	/* raidkm (level 71): m and placement are specified separately on the
+	 * CLI (--parity-count / --layout=rotating|parity-last) and composed into
+	 * `layout` at create time.  Both default to UnSet; see Create.c. */
+	int	parity_count;		/* m (parity disks); UnSet = default RAIDKM_MIN_M */
+	int	raidkm_rotating;	/* UnSet = default rotating; 0 = parity-last; 1 = rotating */
 	int	chunk;
 	int	bitmap_chunk;
 	enum bitmap_type btype;

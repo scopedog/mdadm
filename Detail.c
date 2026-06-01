@@ -577,10 +577,11 @@ int Detail(char *dev, struct context *c)
 			printf("\n");
 		}
 		if (array.level == LEVEL_RAIDKM) {
-			printf("            Layout : m=%d (parity disks), %s\n",
-			       RAIDKM_LAYOUT_M(array.layout),
+			printf("            Layout : %s\n",
 			       (array.layout & RAIDKM_LAYOUT_ROTATING) ?
-			       "rotating" : "parity-N");
+			       "rotating" : "parity-last");
+			printf("      Parity Count : %d\n",
+			       RAIDKM_LAYOUT_M(array.layout));
 		}
 		switch (array.level) {
 		case 0:
