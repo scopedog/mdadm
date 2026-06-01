@@ -1592,6 +1592,11 @@ extern int restore_backup(struct supertype *st,
 			  char **backup_filep,
 			  int verbose);
 extern int Grow_continue_command(char *devname, int fd, struct context *c);
+/* raidkm rotating add-parity windowed relocation: crash resume from a backup
+ * file's state sidecar (the array is stopped after a crash, so this works from
+ * the raw members without an active array). */
+extern int raidkm_rotating_resume_pending(const char *bf);
+extern int raidkm_grow_parity_rotating_resume(const char *bf, struct context *c);
 
 extern int Assemble(struct supertype *st, char *mddev,
 		    struct mddev_ident *ident,

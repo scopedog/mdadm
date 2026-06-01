@@ -1404,6 +1404,16 @@ int main(int argc, char *argv[])
 		if (ident_set_devname(&ident, devlist->devname) != MDADM_STATUS_SUCCESS)
 			exit(1);
 
+		/* raidkm: a rotating add-parity windowed relocation interrupted by a
+		 * crash leaves the array stopped (so the open below would fail) and a
+		 * state sidecar next to --backup-file.  Re-running the grow with that
+		 * backup file resumes the relocation from the raw members. */
+		if (mode == GROW && c.backup_file &&
+		    raidkm_rotating_resume_pending(c.backup_file)) {
+			int rr = raidkm_grow_parity_rotating_resume(c.backup_file, &c);
+			exit(rr ? 1 : 0);
+		}
+
 		if (mode == MANAGE || mode == GROW) {
 			mdfd = open_mddev(ident.devname, 1);
 			if (mdfd < 0)
