@@ -2002,21 +2002,142 @@ static int set_new_data_offset(struct mdinfo *sra, struct supertype *st,
  * data_offset, the grow is refused rather than run unsafe.
  */
 #define RAIDKM_ADDPARITY_SHIFT_CHUNKS 4
+/*
+ * Stream `bytes` from in_fd to out_fd (both positioned at 0), then fsync the
+ * destination.  Used to save the array's logical content to the backup file
+ * and to restore it afterward.  Returns 0 on success.
+ */
+#define RAIDKM_MIGRATE_BUFSZ (4 * 1024 * 1024)
+static int raidkm_copy_fd(int in_fd, int out_fd, unsigned long long bytes,
+			  const char *what, int verbose)
+{
+	char *buf = xmalloc(RAIDKM_MIGRATE_BUFSZ);
+	unsigned long long done = 0;
+	int rv = 1;
+
+	if (lseek(in_fd, 0, SEEK_SET) != 0 || lseek(out_fd, 0, SEEK_SET) != 0) {
+		pr_err("raidkm grow: %s: seek failed: %s\n", what, strerror(errno));
+		goto out;
+	}
+	while (done < bytes) {
+		unsigned long long want = bytes - done;
+		ssize_t r, off;
+
+		if (want > RAIDKM_MIGRATE_BUFSZ)
+			want = RAIDKM_MIGRATE_BUFSZ;
+		r = read(in_fd, buf, want);
+		if (r <= 0) {
+			pr_err("raidkm grow: %s: read at %llu failed: %s\n",
+			       what, done, r ? strerror(errno) : "short read");
+			goto out;
+		}
+		for (off = 0; off < r; ) {
+			ssize_t w = write(out_fd, buf + off, r - off);
+			if (w <= 0) {
+				pr_err("raidkm grow: %s: write at %llu failed: %s\n",
+				       what, done + (unsigned long long)off,
+				       strerror(errno));
+				goto out;
+			}
+			off += w;
+		}
+		done += r;
+		if (verbose > 0 &&
+		    (done % (256ULL << 20)) < RAIDKM_MIGRATE_BUFSZ)
+			pr_err("raidkm grow: %s: %llu/%llu MiB\n",
+			       what, done >> 20, bytes >> 20);
+	}
+	if (fsync(out_fd) != 0) {
+		pr_err("raidkm grow: %s: fsync failed: %s\n", what, strerror(errno));
+		goto out;
+	}
+	rv = 0;
+out:
+	free(buf);
+	return rv;
+}
+
+/*
+ * Drop a small sidecar marker next to the backup file so an interrupted
+ * migration is visible: it records that the array's data is staged in the
+ * backup file and a restore is pending.  contents==NULL removes it.
+ */
+static void raidkm_migrate_marker(const char *bf, const char *contents)
+{
+	char path[4096];
+	int mfd;
+
+	if (snprintf(path, sizeof(path), "%s.raidkm-migrate", bf) >= (int)sizeof(path))
+		return;
+	if (!contents) {
+		unlink(path);
+		return;
+	}
+	mfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (mfd < 0)
+		return;
+	if (write(mfd, contents, strlen(contents)) < 0) {
+		/* best effort marker; ignore write error */
+	}
+	fsync(mfd);
+	close(mfd);
+}
+
+/*
+ * raidkm_grow_parity_rotating() - add ONE parity disk (m -> m+1) to a
+ * rotating-layout raidkm array, OUT OF PLACE.
+ *
+ * A rotating reshape relocates every block.  Doing that in place (the old
+ * approach) overwrites old on-disk locations that delayed reads can still
+ * target, causing silent, scrub-clean corruption under concurrent I/O (the
+ * read/write location-aliasing race; confirmed by instrumentation).  Instead
+ * we stage the entire logical content through a backup file so no in-place
+ * relocation ever happens:
+ *
+ *   1. SAVE    - read the whole array (old layout, online, pure reads) into
+ *                the backup file, then fsync it;
+ *   2. STOP    - stop the array;
+ *   3. RECREATE- create at the new geometry (m+1, rotating, +1 disk, same
+ *                data_offset/uuid/name, --assume-clean: no resync, we are
+ *                about to overwrite everything);
+ *   4. RESTORE - write the backup file back through the array; the kernel
+ *                lays each block out in the new rotation and computes parity
+ *                via normal writes.
+ *
+ * No block is ever read from a location another write is concurrently
+ * overwriting, so the aliasing race is structurally impossible.  The backup
+ * file is the crash-recovery source across the stop/recreate/restore window
+ * (a marker sidecar flags an interrupted run; the data is preserved in the
+ * file).  Requires --backup-file with free space >= the array size, and the
+ * array must be idle (no concurrent writes) for the duration.
+ */
 static int raidkm_grow_parity_rotating(char *devname, int fd,
 				       struct mddev_dev *devlist,
 				       struct context *c, struct shape *s,
 				       struct mdu_array_info_s *array)
 {
-	struct mdinfo *sra = NULL;
-	struct supertype *st = NULL;
+	struct mdinfo *sra = NULL, *mdi;
+	struct supertype *st = NULL, *nst = NULL;
+	struct mddev_ident ident;
+	struct shape news;
+	struct context cc;
+	struct mddev_dev *complist = NULL, **tail = &complist, *dv, *nd;
+	char *paths[RAIDKM_MAX_DISKS];
+	unsigned long long data_offset = INVALID_SECTORS;
+	unsigned long long array_bytes = 0;
 	int old_n = array->raid_disks;
 	int old_m = RAIDKM_LAYOUT_M(array->layout);
 	int new_m = old_m + 1;
 	int new_n = old_n + 1;
-	int new_layout = (array->layout & ~RAIDKM_LAYOUT_M_MASK) | new_m;
-	unsigned long long min_change;
-	int n_added = 0, froze = 0, dfd, rv = 1;
-	struct mddev_dev *dv;
+	int k = old_n - old_m;
+	int n_added = 0, dfd, rv = 1, i;
+	int uuid[4], uuid_set = 0;
+	char name[33] = "";
+	char mdesc[16], marker[512];
+	const char *bf = c->backup_file;
+
+	for (i = 0; i < RAIDKM_MAX_DISKS; i++)
+		paths[i] = NULL;
 
 	for (dv = devlist; dv; dv = dv->next)
 		n_added++;
@@ -2044,6 +2165,10 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 		       array->active_disks, old_n);
 		return 1;
 	}
+	if (!bf) {
+		pr_err("raidkm grow: rotating add-parity stages the array through a backup file to avoid in-place corruption; supply --backup-file=<path> on a filesystem with free space >= the array size.\n");
+		return 1;
+	}
 	dfd = dev_open(devlist->devname, O_RDONLY | O_EXCL);
 	if (dfd < 0) {
 		pr_err("raidkm grow: cannot open new device %s exclusively: %s\n",
@@ -2052,105 +2177,216 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 	}
 	close(dfd);
 
-	if (c->verbose >= 0)
-		pr_err("raidkm grow: %s adding a parity disk: m=%d->%d (raid-devices %d->%d, k=%d, rotating) via online reshape\n",
-		       devname, old_m, new_m, old_n, new_n, old_n - old_m);
-
-	st = super_by_fd(fd, NULL);
-	if (!st) {
-		pr_err("raidkm grow: cannot load metadata handler for %s\n", devname);
+	if (get_dev_size(fd, devname, &array_bytes) == 0 || array_bytes == 0) {
+		pr_err("raidkm grow: cannot determine array size of %s\n", devname);
 		return 1;
 	}
 
-	sra = sysfs_read(fd, NULL, GET_VERSION | GET_LEVEL | GET_DISKS);
+	/* --- capture live geometry (member paths in role order, offset, id) --- */
+	sra = sysfs_read(fd, NULL, GET_DEVS | GET_OFFSET | GET_STATE | GET_COMPONENT);
 	if (!sra) {
-		pr_err("raidkm grow: cannot read sysfs state for %s\n", devname);
+		pr_err("raidkm grow: cannot read array state for %s\n", devname);
+		return 1;
+	}
+	for (mdi = sra->devs; mdi; mdi = mdi->next) {
+		int role = mdi->disk.raid_disk;
+
+		if (role < 0 || role >= old_n || paths[role])
+			continue;
+		paths[role] = map_dev(mdi->disk.major, mdi->disk.minor, 0);
+		if (data_offset == INVALID_SECTORS)
+			data_offset = mdi->data_offset;
+		else if (mdi->data_offset != data_offset) {
+			pr_err("raidkm grow: members have differing data offsets; not supported\n");
+			goto out;
+		}
+	}
+	for (i = 0; i < old_n; i++)
+		if (!paths[i]) {
+			pr_err("raidkm grow: could not resolve member device for slot %d\n", i);
+			goto out;
+		}
+
+	st = super_by_fd(fd, NULL);
+	if (!st) {
+		pr_err("raidkm grow: cannot determine metadata type for %s\n", devname);
 		goto out;
 	}
-	froze = sysfs_freeze_array(sra);
-	if (froze < 0) {
-		pr_err("raidkm grow: %s is busy (resync/reshape in progress); retry when idle\n",
-		       devname);
+	snprintf(mdesc, sizeof(mdesc), "1.%d", st->minor_version);
+	dfd = dev_open(paths[0], O_RDONLY);
+	if (dfd >= 0) {
+		if (st->ss->load_super(st, dfd, NULL) == 0) {
+			struct mdinfo inf;
+			unsigned char *ub;
+			char ustr[40];
+
+			memset(&inf, 0, sizeof(inf));
+			st->ss->getinfo_super(st, &inf, NULL);
+			ub = (unsigned char *)inf.uuid;
+			snprintf(ustr, sizeof(ustr),
+				 "%02x%02x%02x%02x:%02x%02x%02x%02x:"
+				 "%02x%02x%02x%02x:%02x%02x%02x%02x",
+				 ub[0], ub[1], ub[2], ub[3], ub[4], ub[5],
+				 ub[6], ub[7], ub[8], ub[9], ub[10], ub[11],
+				 ub[12], ub[13], ub[14], ub[15]);
+			uuid_set = parse_uuid(ustr, uuid);
+			snprintf(name, sizeof(name), "%s", inf.name);
+			st->ss->free_super(st);
+		}
+		close(dfd);
+	}
+	if (!uuid_set)
+		pr_err("raidkm grow: warning - could not read member superblock; array will get a fresh UUID\n");
+
+	nst = st->ss->match_metadata_desc(mdesc);
+	if (!nst) {
+		pr_err("raidkm grow: cannot get metadata handler for %s\n", mdesc);
 		goto out;
-	}
-
-	/* 1. add the new parity disk as a spare (frozen => no spurious recovery) */
-	if (Manage_subdevs(devname, fd, devlist, c->verbose, 0, UOPT_UNDEFINED,
-			   c->force)) {
-		pr_err("raidkm grow: failed to add the new disk to %s\n", devname);
-		goto out_unfreeze;
-	}
-
-	/* 2. reserve a BACKWARD data_offset shift for crash safety.  add-parity
-	 *    keeps the data-disk count k fixed, so writepos == readpos and there
-	 *    is no slack: without a shift, a clean run is fine but a power loss
-	 *    mid-reshape would have overwritten not-yet-checkpointed source data.
-	 *    Shift size = RAIDKM_ADDPARITY_SHIFT_CHUNKS chunks; derivation in the
-	 *    kernel's reshape_request() says shift_chunks must be > 2 so that
-	 *    readpos > writepos at every pass (the metadata-flush trigger).  We
-	 *    use 4 (one chunk of margin over the minimum), which costs ~4 chunks
-	 *    of head-space per disk and gives the kernel comfortable slack.
-	 *    Passing delta_disks=+1 makes set_new_data_offset choose the decrease
-	 *    direction the kernel demands for a disk-count grow; a fresh re-read
-	 *    carries the just-added spare so it gets a new_offset too. */
-	{
-		struct mdinfo *dsra;
-
-		dsra = sysfs_read(fd, NULL,
-			GET_COMPONENT | GET_DEVS | GET_OFFSET | GET_STATE | GET_CHUNK);
-
-		if (!dsra) {
-			pr_err("raidkm grow: cannot re-read sysfs for the data_offset shift on %s\n",
-			       devname);
-			goto out_unfreeze;
-		}
-		min_change = ((unsigned long long)array->chunk_size >> 9)
-			     * RAIDKM_ADDPARITY_SHIFT_CHUNKS;
-		if (set_new_data_offset(dsra, st, devname, 1, INVALID_SECTORS,
-					min_change, 0) != 0) {
-			sysfs_free(dsra);
-			pr_err("raidkm grow: cannot reserve a data_offset shift for crash-safe add-parity on %s (insufficient head-space before data, or metadata lacks data_offset support); reshape NOT started\n",
-			       devname);
-			goto out_unfreeze;
-		}
-		sysfs_free(dsra);
-	}
-
-	/* 3. bump raid_disks (delta_disks=+1; layout unchanged here, so the
-	 *    kernel accepts it as a disk-count change and sizes the cache.  The
-	 *    backward new_offset set above satisfies its "grow => new_offset <=
-	 *    data_offset" requirement). */
-	if (sysfs_set_num(sra, NULL, "raid_disks", new_n) != 0) {
-		pr_err("raidkm grow: failed to set raid_disks=%d; reshape NOT started\n",
-		       new_n);
-		goto out_unfreeze;
-	}
-	/* 4. set the new layout (m+1, same rotating placement); delta_disks is
-	 *    still +1, so raidkm_check_reshape recognizes the add-parity. */
-	if (sysfs_set_num(sra, NULL, "layout", new_layout) != 0) {
-		pr_err("raidkm grow: failed to set layout for m=%d; reshape NOT started\n",
-		       new_m);
-		goto out_unfreeze;
-	}
-	/* 5. start the reshape (this also clears the freeze). */
-	if (sysfs_set_str(sra, NULL, "sync_action", "reshape") < 0) {
-		pr_err("raidkm grow: failed to start reshape on %s\n", devname);
-		goto out_unfreeze;
 	}
 
 	if (c->verbose >= 0)
-		pr_err("raidkm grow: reshape started on %s; monitor with /proc/mdstat or --detail\n",
-		       devname);
-	rv = 0;
-	goto out;
+		pr_err("raidkm grow: %s rotating add-parity m=%d->%d (raid-devices %d->%d, k=%d) out-of-place via %s (%llu MiB)\n",
+		       devname, old_m, new_m, old_n, new_n, k, bf, array_bytes >> 20);
 
-out_unfreeze:
-	if (froze > 0)
-		sysfs_set_str(sra, NULL, "sync_action", "idle");
+	/* --- 1. SAVE: stream the whole array into the backup file --- */
+	{
+		int bfd = open(bf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+		if (bfd < 0) {
+			pr_err("raidkm grow: cannot create backup file %s: %s\n",
+			       bf, strerror(errno));
+			goto out;
+		}
+		if (c->verbose >= 0)
+			pr_err("raidkm grow: saving array data to %s ...\n", bf);
+		if (raidkm_copy_fd(fd, bfd, array_bytes, "save", c->verbose)) {
+			close(bfd);
+			goto out;
+		}
+		close(bfd);
+	}
+	/* mark restore-pending: from here until restore completes, the only
+	 * complete copy of the data is the backup file. */
+	snprintf(marker, sizeof(marker),
+		 "raidkm rotating add-parity in progress\n"
+		 "array=%s m=%d->%d raid-devices=%d->%d bytes=%llu\n"
+		 "restore: recreate at the new geometry, then write %s back to it.\n",
+		 devname, old_m, new_m, old_n, new_n, array_bytes, bf);
+	raidkm_migrate_marker(bf, marker);
+
+	/* --- 2. STOP (fd is invalid afterwards) --- */
+	if (Manage_stop(devname, fd, c->verbose, 0)) {
+		pr_err("raidkm grow: failed to stop %s; array NOT modified (data saved in %s)\n",
+		       devname, bf);
+		goto out;
+	}
+
+	/* --- 3. RECREATE at the new geometry (assume-clean: restore overwrites
+	 *        everything, so an initial resync would be wasted). --- */
+	for (i = 0; i < old_n; i++) {
+		nd = xcalloc(1, sizeof(*nd));
+		nd->devname = paths[i];
+		nd->data_offset = INVALID_SECTORS;
+		*tail = nd;
+		tail = &nd->next;
+	}
+	for (dv = devlist; dv; dv = dv->next) {
+		nd = xcalloc(1, sizeof(*nd));
+		nd->devname = dv->devname;
+		nd->data_offset = INVALID_SECTORS;
+		*tail = nd;
+		tail = &nd->next;
+	}
+
+	memset(&ident, 0, sizeof(ident));
+	ident.devname = devname;
+	ident.super_minor = UnSet;
+	ident.level = LEVEL_RAIDKM;
+	ident.raid_disks = new_n;
+	if (uuid_set) {
+		memcpy(ident.uuid, uuid, sizeof(uuid));
+		ident.uuid_set = 1;
+	}
+	if (name[0])
+		snprintf(ident.name, sizeof(ident.name), "%s", name);
+
+	memset(&news, 0, sizeof(news));
+	news.level = LEVEL_RAIDKM;
+	news.raiddisks = new_n;
+	news.parity_count = new_m;
+	news.raidkm_rotating = 1;		/* rotating placement preserved */
+	news.layout = new_m | RAIDKM_LAYOUT_ROTATING;
+	news.chunk = array->chunk_size / 1024;	/* KiB */
+	news.size = sra->component_size / 2;	/* KiB */
+	news.data_offset = data_offset;
+	news.assume_clean = 1;			/* restore writes data + parity */
+	news.btype = BitmapNone;
+	news.bitmap_chunk = UnSet;
+	news.consistency_policy = CONSISTENCY_POLICY_UNKNOWN;
+
+	cc = *c;
+	cc.force = 1;
+	cc.runstop = 1;
+	cc.backup_file = NULL;	/* Create() must not touch our data backup */
+
+	if (Create(nst, &ident, new_n, complist, &news, &cc)) {
+		pr_err("raidkm grow: recreate at m=%d FAILED; the array data is preserved in %s — recreate the array and write it back.\n",
+		       new_m, bf);
+		goto out;
+	}
+
+	/* --- 4. RESTORE: write the backup file back through the new array.
+	 *        Plain open() (buffered): dev_open() forces O_DIRECT, which needs
+	 *        page-aligned buffers and block-aligned lengths; buffered I/O is
+	 *        simpler here and we fsync at the end. --- */
+	dfd = open(devname, O_RDWR);
+	if (dfd < 0) {
+		pr_err("raidkm grow: cannot open recreated %s to restore data: %s (data preserved in %s)\n",
+		       devname, strerror(errno), bf);
+		goto out;
+	}
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: restoring array data from %s ...\n", bf);
+	{
+		int bfd = open(bf, O_RDONLY);
+
+		if (bfd < 0) {
+			pr_err("raidkm grow: cannot reopen backup file %s: %s\n",
+			       bf, strerror(errno));
+			close(dfd);
+			goto out;
+		}
+		if (raidkm_copy_fd(bfd, dfd, array_bytes, "restore", c->verbose)) {
+			close(bfd);
+			close(dfd);
+			goto out;
+		}
+		close(bfd);
+	}
+	close(dfd);
+
+	/* restore complete and durable: clear the marker. */
+	raidkm_migrate_marker(bf, NULL);
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: %s now m=%d rotating; data restored and parity rebuilt out-of-place (no in-place relocation).\n",
+		       devname, new_m);
+	rv = 0;
+
 out:
+	while (complist) {
+		nd = complist;
+		complist = complist->next;
+		free(nd);
+	}
+	for (i = 0; i < RAIDKM_MAX_DISKS; i++)
+		free(paths[i]);
 	if (st) {
 		st->ss->free_super(st);
 		free(st);
+	}
+	if (nst) {
+		nst->ss->free_super(nst);
+		free(nst);
 	}
 	if (sra)
 		sysfs_free(sra);
