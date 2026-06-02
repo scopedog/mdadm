@@ -570,8 +570,24 @@ RAID levels.  The default is 0K (i.e. no rounding).
 Set RAID level.  When used with
 .BR \-\-create ,
 options are: linear, raid0, 0, stripe, raid1, 1, mirror, raid4, 4,
-raid5, 5, raid6, 6, raid10, 10, multipath, mp, faulty, container.
+raid5, 5, raid6, 6, raid10, 10, multipath, mp, faulty, container,
+raidkm.
 Obviously some of these are synonymous.
+
+.B raidkm
+(level 71) is an out\-of\-tree Reed\-Solomon k+m personality (provided by the
+md\-kmec module) that generalises RAID6 to an arbitrary number of parity disks.
+The redundancy count, m, is given by
+.B \-\-parity\-count
+(2 to 8, default 2) rather than implied by the level, and the parity placement
+is chosen with
+.BR \-\-layout .
+With m=2 it is byte\-compatible on disk with RAID6 and can be converted to and
+from it without moving data (see
+.BR \-\-raidkm\-convert ).
+The
+.B raidkm
+kernel module must be loaded.
 
 When a
 .B CONTAINER
@@ -717,12 +733,75 @@ The converse of this is
 which will change a non-standard RAID6 layout into a more standard
 arrangement.
 
+For
+.B raidkm
+arrays the layout selects only the parity
+.IR placement ,
+and is one of
+.B rotating
+(the default \(em the m parity blocks rotate across all members, one disk per
+stripe, like RAID5/6 left\-symmetric, so parity and read traffic spread over
+every device) or
+.B parity\-last
+(aliases
+.BR dedicated ", " fixed ", " parity\-n
+\(em the m parity blocks sit on the last m devices, RAID4\-style).  The
+redundancy count m is set separately with
+.BR \-\-parity\-count ,
+not packed into the layout.  The layout type is fixed for the life of the array
+and cannot be changed by
+.BR \-\-grow .
+
 .TP
 .BR \-\-parity=
 same as
 .B \-\-layout
 (thus explaining the p of
 .BR \-p ).
+
+.TP
+.BR \-\-parity\-count= ", " \-\-parities=
+Set the number of parity disks
+.RI ( m )
+for a
+.B raidkm
+(level 71) array: an integer from 2 to 8, default 2.  The remaining members
+are data disks.  This replaces the older practice of packing m into
+.BR \-\-layout .
+
+.TP
+.B \-\-add\-data
+With
+.BR \-\-grow ,
+add one or more
+.I data
+disks to a
+.B raidkm
+array, growing capacity while leaving the parity count m unchanged.  This is an
+online reshape (the array stays available) in which the named spares become
+data members and every block is restriped; no backup file is needed.
+
+.TP
+.B \-\-add\-parity
+With
+.BR \-\-grow ,
+add one
+.I parity
+disk to a
+.B raidkm
+array, raising m by one (m to m+1) and increasing the fault tolerance.  This is
+an
+.B offline
+operation \(em stop the array first.  For the
+.B parity\-last
+layout the new parity disk is appended and resynced with no data movement; for
+the
+.B rotating
+layout every block must be relocated, so it runs as a windowed relocation that
+requires a
+.B \-\-backup\-file
+(a bounded scratch window, not array\-sized) and can resume after a crash by
+re\-running the same command.  See the GROW MODE section.
 
 .TP
 .BR \-b ", " \-\-bitmap=
@@ -2836,6 +2915,34 @@ does crash during the critical period, the same file must be passed to
 to restore the backup and reassemble the array.  When shrinking rather
 than growing the array, the reshape is done from the end towards the
 beginning, so the "critical section" is at the end of the reshape.
+
+.SS RAIDKM (LEVEL 71) RESHAPE
+
+A
+.B raidkm
+array can be grown in two ways.  Adding
+.I data
+disks with
+.B "\-\-grow \-\-add\-data"
+keeps the parity count m fixed and increases capacity; this is an online
+reshape, like a RAID5/6 device grow, and needs no backup file.  Adding a
+.I parity
+disk with
+.B "\-\-grow \-\-add\-parity"
+raises m by one and is an
+.B offline
+operation, so the array must be stopped first.  For the
+.B parity\-last
+layout the new parity disk is simply appended and resynced and no data is
+moved; for the
+.B rotating
+layout the data must be relocated, which is done in bounded windows recorded in
+a
+.B \-\-backup\-file
+so that an interrupted relocation can be resumed by re\-running the same
+command.  Reducing the number of data disks or the parity count is not yet
+supported.  The layout type (rotating versus parity\-last) is fixed and cannot
+be changed by a reshape.
 
 .SS LEVEL CHANGES
 
