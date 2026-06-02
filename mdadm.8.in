@@ -1670,6 +1670,46 @@ Be careful when calling \-\-zero\-superblock with clustered raid. Make sure
 the array isn't used or assembled in another cluster node before executing it.
 
 .TP
+.B \-\-raidkm\-convert
+Convert the superblocks of a stopped array in place between stock
+.B RAID6
+and
+.B raidkm
+(the out-of-tree level\-71 k+m personality), changing only the on\-disk
+metadata.  A stock RAID6 array using the default
+.B left\-symmetric
+layout (which has two parity blocks, m=2) is byte\-for\-byte identical on disk
+to a
+.B raidkm
+array with the
+.B rotating
+layout and a parity count of 2 \(em same data and parity placement, same data
+offset \(em so the conversion moves
+.B no data:
+it only rewrites each listed member's
+.B level
+and
+.B layout
+fields (and the checksum).  The direction is auto\-detected from the current
+superblock (RAID6 \(-> raidkm, or raidkm \(-> RAID6).
+
+Each named device must be an
+.I individual member
+of the array, and the array must be
+.B stopped
+(the device is opened exclusively).  Only RAID6 left\-symmetric and raidkm
+rotating m=2 are accepted; any other level, layout, or parity count is refused,
+since no other geometry is byte\-compatible.  Supports 1.x metadata only.  To
+assemble the result, a raidkm\-aware
+.I mdadm
+and a loaded
+.B raidkm
+kernel module are required.  The helper script
+.B tools/raidkm\-convert.sh
+in the md\-kmec source tree wraps this for a whole array (discovering members,
+stopping, converting, and re\-assembling).
+
+.TP
 .B \-\-kill\-subarray=
 If the device is a container and the argument to \-\-kill\-subarray
 specifies an inactive subarray in the container, then the subarray is
