@@ -2236,6 +2236,27 @@ static int raidkm_recreate_rotating(const struct raidkm_reloc *r, struct context
 	cc.runstop = 1;
 	cc.backup_file = NULL;
 
+	/* The relocation just wrote every member, which fires uevents that make
+	 * udev/blkid probe (and transiently hold O_EXCL) the very devices Create
+	 * is about to open exclusively — otherwise seen as "Device or resource
+	 * busy ... create aborted".  Drain those probes by waiting until each
+	 * target opens exclusively (best effort, ~6s budget per device). */
+	for (i = 0; i < new_n; i++) {
+		const char *p = (i < r->old_n) ? r->paths[i] : r->new_path;
+		int tries, t;
+
+		for (tries = 0; tries < 60; tries++) {
+			t = open(p, O_RDONLY | O_EXCL);
+			if (t >= 0) {
+				close(t);
+				break;
+			}
+			if (errno != EBUSY)
+				break;
+			sleep_for(0, MSEC_TO_NSEC(100), true);
+		}
+	}
+
 	rv = Create(nst, &ident, new_n, complist, &news, &cc);
 	while (complist) { nd = complist; complist = complist->next; free(nd); }
 	nst->ss->free_super(nst);
@@ -2350,7 +2371,31 @@ out:
 	return rv;
 }
 
-/* Open all new_n members (old role order + the new disk) O_RDWR into fds. */
+/* Open one member O_RDWR|O_EXCL, retrying briefly on EBUSY (the array we just
+ * stopped, or a udev probe, may still hold it for a moment). */
+static int raidkm_open_excl(const char *path)
+{
+	int tries, fd;
+
+	for (tries = 0; tries < 60; tries++) {
+		fd = open(path, O_RDWR | O_EXCL);
+		if (fd >= 0)
+			return fd;
+		if (errno != EBUSY)
+			break;
+		sleep_for(0, MSEC_TO_NSEC(100), true);
+	}
+	return -1;
+}
+
+/*
+ * Open all new_n members (old role order + the new disk) O_RDWR|O_EXCL into fds.
+ * EXCLUSIVE matters: the members still carry their old superblocks during the
+ * relocation, so without an exclusive hold udev would auto-assemble the array
+ * underneath us — racing our raw writes (corruption) and later blocking the
+ * recreate's exclusive open.  Holding O_EXCL for the whole relocation prevents
+ * any assembly from forming.
+ */
 static int raidkm_open_members(const struct raidkm_reloc *r, int *fds)
 {
 	int new_n = r->old_n + 1, j;
@@ -2358,20 +2403,39 @@ static int raidkm_open_members(const struct raidkm_reloc *r, int *fds)
 	for (j = 0; j < new_n; j++)
 		fds[j] = -1;
 	for (j = 0; j < r->old_n; j++) {
-		fds[j] = open(r->paths[j], O_RDWR);
+		fds[j] = raidkm_open_excl(r->paths[j]);
 		if (fds[j] < 0) {
-			pr_err("raidkm grow: cannot open member %s: %s\n",
+			pr_err("raidkm grow: cannot open member %s exclusively: %s\n",
 			       r->paths[j], strerror(errno));
 			return 1;
 		}
 	}
-	fds[r->old_n] = open(r->new_path, O_RDWR);
+	fds[r->old_n] = raidkm_open_excl(r->new_path);
 	if (fds[r->old_n] < 0) {
-		pr_err("raidkm grow: cannot open new disk %s: %s\n",
+		pr_err("raidkm grow: cannot open new disk %s exclusively: %s\n",
 		       r->new_path, strerror(errno));
 		return 1;
 	}
 	return 0;
+}
+
+/*
+ * Invalidate the members' old superblocks before relocation begins.  Mid-
+ * migration the array is NOT a valid m=old_m array (its data is half-relocated),
+ * so leaving bootable old superblocks lets udev auto-assemble it after a crash
+ * and serve corrupt data — and blocks the resume's exclusive open.  Zeroing the
+ * superblocks makes the half-migrated array un-assemblable; all geometry needed
+ * to finish lives in the sidecar state file, and the recreate writes fresh
+ * superblocks.  Best effort (Kill returns 4 if a device has none, e.g. the new
+ * disk), so failures here are not fatal.
+ */
+static void raidkm_zero_old_sbs(const struct raidkm_reloc *r, struct context *c)
+{
+	int j;
+
+	for (j = 0; j < r->old_n; j++)
+		Kill((char *)r->paths[j], NULL, 1, c->verbose, 1);
+	Kill((char *)r->new_path, NULL, 1, c->verbose, 1);
 }
 
 /*
@@ -2401,12 +2465,33 @@ int raidkm_grow_parity_rotating_resume(const char *bf, struct context *c)
 		pr_err("raidkm grow: RESUMING interrupted rotating add-parity m=%d->%d (k=%d, %llu rows) from %s\n",
 		       r.old_m, r.new_m, r.k, r.rows, bf);
 
+	/* A crash can land in the brief window before the original run zeroed the
+	 * old superblocks, so the half-migrated array may have auto-assembled.
+	 * Tear it down (best effort) so we can grab the members exclusively, then
+	 * (re-)invalidate the superblocks so nothing re-assembles under us. */
+	{
+		int mdfd = open(r.devname, O_RDONLY);
+
+		if (mdfd >= 0) {
+			Manage_stop(r.devname, mdfd, c->verbose < 0 ? -1 : 0, 0);
+			close(mdfd);
+		}
+	}
 	if (raidkm_open_members(&r, fds))
 		goto out;
+	raidkm_zero_old_sbs(&r, c);
 
 	/* roll the in-flight batch (in bf) back onto the old members so the
-	 * source data for [blo,end) is intact, then re-run from blo. */
+	 * source data for [blo,end) is intact, then re-run from blo.  If no batch
+	 * was committed before the crash (bf absent), nothing was relocated yet —
+	 * relocate from the start with no rollback. */
 	bfd = open(bf, O_RDONLY);
+	if (bfd < 0 && errno == ENOENT) {
+		if (c->verbose >= 0)
+			pr_err("raidkm grow: no in-flight batch committed; relocating from row 0 ...\n");
+		blo = 0;
+		goto relocate;
+	}
 	if (bfd < 0) {
 		pr_err("raidkm grow: cannot open backup %s: %s\n", bf, strerror(errno));
 		goto out;
@@ -2441,6 +2526,7 @@ int raidkm_grow_parity_rotating_resume(const char *bf, struct context *c)
 	if (c->verbose >= 0)
 		pr_err("raidkm grow: rolled back in-flight batch [%llu,%llu); relocating from row %llu ...\n",
 		       blo, bhi, blo);
+relocate:;
 
 	if (raidkm_relocate_rotating(&r, fds, blo, bf, c->verbose))
 		goto out;
@@ -2664,6 +2750,9 @@ static int raidkm_grow_parity_rotating(char *devname, int fd,
 			goto out;
 		}
 		ok = (raidkm_open_members(&r, fds) == 0);
+		/* From here the array is half-relocated and must not auto-assemble. */
+		if (ok)
+			raidkm_zero_old_sbs(&r, c);
 		if (ok && c->verbose >= 0)
 			pr_err("raidkm grow: relocating %s data (k=%d, %llu rows) for rotating m=%d->%d via %s ...\n",
 			       devname, k, r.rows, old_m, new_m, bf);
