@@ -101,6 +101,7 @@ struct option long_options[] = {
 	{"grow", 0, 0, 'G'},
 	{"incremental", 0, 0, 'I'},
 	{"zero-superblock", 0, 0, KillOpt}, /* deliberately not a short_option */
+	{"raidkm-convert", 0, 0, RaidkmConvert}, /* raidkm: convert raid6<->raidkm SB */
 	{"query", 0, 0, 'Q'},
 	{"examine-bitmap", 0, 0, 'X'},
 	{"auto-detect", 0, 0, AutoDetect},
@@ -467,6 +468,9 @@ char Help_misc[] =
 "  --examine-bitmap -X: Display contents of a bitmap file\n"
 "  --examine-badblocks: Display list of known bad blocks on device\n"
 "  --zero-superblock  : erase the MD superblock from a device.\n"
+"  --raidkm-convert   : convert a stopped raid6 (left-symmetric, m=2) array's\n"
+"                       superblocks to raidkm (level 71, rotating) and back;\n"
+"                       byte-identical on disk, so no data is moved.\n"
 "  --run         -R   : start a partially built array\n"
 "  --stop        -S   : deactivate array, releasing all resources\n"
 "  --readonly    -o   : mark array as readonly\n"

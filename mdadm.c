@@ -297,6 +297,7 @@ int main(int argc, char *argv[])
 		case UpdateSubarray:
 		case UdevRules:
 		case KillOpt:
+		case RaidkmConvert:
 			if (!mode)
 				newmode = MISC;
 			break;
@@ -1106,6 +1107,7 @@ int main(int argc, char *argv[])
 		case O(MISC,'D'):
 		case O(MISC,'E'):
 		case O(MISC,KillOpt):
+		case O(MISC,RaidkmConvert):
 		case O(MISC,'R'):
 		case O(MISC,'S'):
 		case O(MISC,'X'):
@@ -2043,6 +2045,9 @@ static int misc_list(struct mddev_dev *devlist,
 				} while (rv == 0);
 				rv &= ~4;
 			}
+			continue;
+		case RaidkmConvert:
+			rv |= Raidkm_convert(dv->devname, c);
 			continue;
 		case 'Q':
 			rv |= Query(dv->devname);

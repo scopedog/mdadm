@@ -538,6 +538,7 @@ enum special_options {
 	OffRootOpt,
 	Prefer,
 	KillOpt,
+	RaidkmConvert,	/* raidkm: in-place superblock convert raid6<->raidkm (level 71) */
 	DataOffset,
 	ExamineBB,
 	Dump,
@@ -1597,6 +1598,11 @@ extern int Grow_continue_command(char *devname, int fd, struct context *c);
  * the raw members without an active array). */
 extern int raidkm_rotating_resume_pending(const char *bf);
 extern int raidkm_grow_parity_rotating_resume(const char *bf, struct context *c);
+/* raidkm: in-place superblock conversion between stock raid6 (left-symmetric,
+ * m=2) and raidkm rotating m=2.  The two are byte-identical on disk, so this
+ * only rewrites level+layout (and the checksum) per member — no data movement.
+ * Auto-detects direction; refuses any other geometry/layout. v1.x metadata. */
+extern int Raidkm_convert(char *devname, struct context *c);
 
 extern int Assemble(struct supertype *st, char *mddev,
 		    struct mddev_ident *ident,

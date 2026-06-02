@@ -3014,6 +3014,109 @@ void *super1_make_v0(struct supertype *st, struct mdinfo *info, mdp_super_t *sb0
 	return ret;
 }
 
+/*
+ * raidkm: in-place superblock conversion between stock raid6 (left-symmetric,
+ * m=2) and raidkm rotating m=2.
+ *
+ * These two geometries are byte-for-byte identical on disk (same data/P/Q slot
+ * placement, same parity bytes, same data_offset) — verified empirically — so a
+ * migration needs to move NO data.  We only rewrite, per member device, the
+ * superblock 'level' and 'layout' fields (and recompute the checksum):
+ *
+ *   raid6  level=6  layout=ALGORITHM_LEFT_SYMMETRIC(2)
+ *      <->
+ *   raidkm level=71 layout=RAIDKM_LAYOUT_ROTATING|2
+ *
+ * Direction is auto-detected from the current superblock.  ANY other source
+ * geometry is refused: only raid6 *left-symmetric* matches raidkm rotating, and
+ * only m=2 has a raid6 equivalent.  The array must be stopped (we take O_EXCL).
+ *
+ * Returns 0 on success; nonzero on refusal / I/O error (so a multi-device run
+ * reports failure but converts the members it can).
+ */
+int Raidkm_convert(char *dev, struct context *c)
+{
+	int fd, rv = 0;
+	struct supertype *st;
+	struct mdp_superblock_1 *sb;
+	unsigned int level, layout, newlevel, newlayout;
+	int verbose = c ? c->verbose : 0;
+
+	fd = open(dev, O_RDWR|O_EXCL);
+	if (fd < 0) {
+		if (verbose >= 0)
+			pr_err("%s: cannot open for write with O_EXCL — stop the array first (mdadm --stop)\n",
+			       dev);
+		return 2;
+	}
+
+	st = guess_super(fd);
+	if (st == NULL || st->ss == NULL || strcmp(st->ss->name, "1.x") != 0) {
+		if (verbose >= 0)
+			pr_err("%s: not a v1.x md superblock — --raidkm-convert supports 1.x metadata only\n",
+			       dev);
+		if (st) {
+			if (st->ss && st->ss->free_super)
+				st->ss->free_super(st);
+			free(st);
+		}
+		close(fd);
+		return 2;
+	}
+	st->ignore_hw_compat = 1;
+
+	if (load_super1(st, fd, dev)) {
+		if (verbose >= 0)
+			pr_err("%s: no usable md superblock found\n", dev);
+		st->ss->free_super(st);
+		free(st);
+		close(fd);
+		return 2;
+	}
+
+	sb = st->sb;
+	level = __le32_to_cpu(sb->level);
+	layout = __le32_to_cpu(sb->layout);
+
+	if (level == 6 && layout == ALGORITHM_LEFT_SYMMETRIC) {
+		newlevel  = LEVEL_RAIDKM;
+		newlayout = RAIDKM_LAYOUT_ROTATING | 2;	/* m=2, rotating */
+	} else if (level == (unsigned int)LEVEL_RAIDKM &&
+		   (layout & RAIDKM_LAYOUT_ROTATING) &&
+		   RAIDKM_LAYOUT_M(layout) == 2) {
+		newlevel  = 6;
+		newlayout = ALGORITHM_LEFT_SYMMETRIC;
+	} else {
+		if (verbose >= 0)
+			pr_err("%s: refusing to convert (level=%u layout=0x%x).\n"
+			       "    Only raid6 left-symmetric <-> raidkm rotating m=2 is byte-compatible.\n",
+			       dev, level, layout);
+		st->ss->free_super(st);
+		free(st);
+		close(fd);
+		return 1;
+	}
+
+	if (verbose >= 0)
+		pr_err("%s: converting level %u layout 0x%x -> level %u layout 0x%x (no data moved)\n",
+		       dev, level, layout, newlevel, newlayout);
+
+	sb->level = __cpu_to_le32(newlevel);
+	sb->layout = __cpu_to_le32(newlayout);
+	sb->sb_csum = calc_sb_1_csum(sb);
+
+	if (store_super1(st, fd)) {
+		if (verbose >= 0)
+			pr_err("%s: failed to write converted superblock\n", dev);
+		rv = 1;
+	}
+
+	st->ss->free_super(st);
+	free(st);
+	close(fd);
+	return rv;
+}
+
 struct superswitch super1 = {
 	.examine_super = examine_super1,
 	.brief_examine_super = brief_examine_super1,
