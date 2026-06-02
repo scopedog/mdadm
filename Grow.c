@@ -3124,8 +3124,13 @@ int Grow_reshape(char *devname, int fd,
 	/* raidkm (level 71): --add-data adds data disk(s) via the kernel online
 	 * reshape; --add-parity (and legacy bare --add) adds parity via the
 	 * offline stop/recreate/resync.  Neither uses the generic raid4/5/6
-	 * reshape path. */
-	if (array.level == LEVEL_RAIDKM) {
+	 * reshape path.  ONLY route disk-adding grows here — a size-only grow
+	 * (--grow --size, raidkm_grow unset, no devices/raid-devices change) is
+	 * NOT an add-parity, and must fall through to the generic resize path
+	 * (which drives the kernel's raid5_resize for level 71). */
+	if (array.level == LEVEL_RAIDKM &&
+	    (s->raidkm_grow != RAIDKM_GROW_UNSET || devlist != NULL ||
+	     s->raiddisks)) {
 		if (s->raidkm_grow == RAIDKM_GROW_DATA)
 			return raidkm_grow_data(devname, fd, devlist, c, s, &array);
 		return raidkm_grow_parity(devname, fd, devlist, c, s, &array);
