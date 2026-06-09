@@ -2798,6 +2798,128 @@ out:
 }
 
 /*
+ * raidkm_grow_parity_online() - add ONE parity disk (m -> m+1) via the in-kernel
+ * COW-staged online reshape.  Unlike the offline migration this keeps the array
+ * up and is crash-recoverable from the kernel journal (no backup file needed).
+ *
+ * mdadm stages the new layout (the m+1 parity-count packed into the layout word)
+ * with the "layout" sysfs attr BEFORE bumping raid_disks; the kernel
+ * raidkm_check_reshape() defers the layout-only step and does the real setup
+ * when raid_disks is written.  Then "sync_action=reshape" starts it.
+ */
+static int raidkm_grow_parity_online(char *devname, int fd,
+				     struct mddev_dev *devlist,
+				     struct context *c, struct shape *s,
+				     struct mdu_array_info_s *array)
+{
+	struct mdinfo *sra = NULL;
+	struct mddev_dev *dv;
+	int old_n = array->raid_disks;
+	int old_m = RAIDKM_LAYOUT_M(array->layout);
+	int rotating = !!(array->layout & RAIDKM_LAYOUT_ROTATING);
+	int n_added = 0, new_m, new_n, new_layout, froze = 0;
+
+	for (dv = devlist; dv; dv = dv->next)
+		n_added++;
+
+	new_m = (s->parity_count != UnSet) ? s->parity_count
+					   : old_m + (n_added ? n_added : 1);
+	if (new_m != old_m + 1) {
+		pr_err("raidkm grow: online add-parity adds exactly one parity (m=%d->%d); repeat for a larger jump\n",
+		       old_m, old_m + 1);
+		return 1;
+	}
+	if (new_m > RAIDKM_MAX_M) {
+		pr_err("raidkm grow: m may not exceed %d\n", RAIDKM_MAX_M);
+		return 1;
+	}
+	new_n = old_n + 1;
+	if (s->raiddisks > 0 && s->raiddisks != new_n) {
+		pr_err("raidkm grow: add-parity to m=%d needs --raid-devices=%d (got %d)\n",
+		       new_m, new_n, s->raiddisks);
+		return 1;
+	}
+	if (n_added > 1) {
+		pr_err("raidkm grow: add exactly one parity disk per reshape (got %d)\n",
+		       n_added);
+		return 1;
+	}
+	if (n_added == 0 && array->spare_disks < 1) {
+		pr_err("raidkm grow: supply the new parity disk with --add-parity <dev>, or --add a spare first\n");
+		return 1;
+	}
+	if (array->active_disks < old_n) {
+		pr_err("raidkm grow: array is degraded (%d of %d present); refusing to add parity\n",
+		       array->active_disks, old_n);
+		return 1;
+	}
+
+	new_layout = new_m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0);
+
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: %s add-parity m=%d->%d (raid-devices %d->%d, %s) via online COW reshape\n",
+		       devname, old_m, new_m, old_n, new_n,
+		       rotating ? "rotating" : "parity-N");
+
+	sra = sysfs_read(fd, NULL, GET_VERSION | GET_LEVEL | GET_DISKS);
+	if (!sra) {
+		pr_err("raidkm grow: cannot read sysfs state for %s\n", devname);
+		return 1;
+	}
+	froze = sysfs_freeze_array(sra);
+	if (froze < 0) {
+		pr_err("raidkm grow: %s is busy (resync/reshape in progress); retry when idle\n",
+		       devname);
+		goto out;
+	}
+
+	/* 1. add the new parity disk as a spare (skipped in the two-step form). */
+	if (n_added > 0 &&
+	    Manage_subdevs(devname, fd, devlist, c->verbose, 0, UOPT_UNDEFINED,
+			   c->force)) {
+		pr_err("raidkm grow: failed to add the new parity disk to %s\n", devname);
+		goto out_unfreeze;
+	}
+
+	/* 2. stage the new layout (m+1); the kernel defers until raid_disks bumps. */
+	if (sysfs_set_num(sra, NULL, "layout", new_layout) != 0) {
+		pr_err("raidkm grow: failed to stage new layout (m=%d) on %s\n",
+		       new_m, devname);
+		goto out_unfreeze;
+	}
+
+	/* 3. bump raid_disks -> kernel add-parity reshape setup. */
+	if (sysfs_set_num(sra, NULL, "raid_disks", new_n) != 0) {
+		pr_err("raidkm grow: failed to set raid_disks=%d; reshape NOT started\n",
+		       new_n);
+		goto out_revert;
+	}
+
+	/* 4. start the reshape (clears the freeze).  No backup file: the COW
+	 *    journal makes a crash recoverable on assembly. */
+	if (sysfs_set_str(sra, NULL, "sync_action", "reshape") < 0) {
+		pr_err("raidkm grow: failed to start reshape on %s\n", devname);
+		goto out_revert;
+	}
+
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: add-parity reshape started on %s; monitor /proc/mdstat or --detail\n",
+		       devname);
+	sysfs_free(sra);
+	return 0;
+
+out_revert:
+	sysfs_set_num(sra, NULL, "layout", array->layout);
+out_unfreeze:
+	if (froze > 0)
+		sysfs_set_str(sra, NULL, "sync_action", "idle");
+out:
+	if (sra)
+		sysfs_free(sra);
+	return 1;
+}
+
+/*
  * raidkm_grow_parity() - add parity disk(s) to a raidkm (level 71) array.
  *
  * raidkm keeps data on disks [0, raid_disks - m) and never relocates it
@@ -2848,11 +2970,18 @@ static int raidkm_grow_parity(char *devname, int fd,
 		paths[i] = NULL;
 
 	/* A rotating array cannot use the cheap PARITY_N append-and-recreate:
-	 * adding parity there relocates every block, so it is driven by the
-	 * inherited online reshape instead. */
-	if (old_rotating)
-		return raidkm_grow_parity_rotating(devname, fd, devlist, c, s,
-						   array);
+	 * adding parity there relocates every block.  Drive it through the
+	 * in-kernel COW-staged online reshape (crash-recoverable, no backup
+	 * file), which supersedes the older offline windowed migration.  The
+	 * offline path remains reachable as an escape hatch via
+	 * MDADM_RAIDKM_OFFLINE_ADDPARITY for kernels without the COW reshape. */
+	if (old_rotating) {
+		if (getenv("MDADM_RAIDKM_OFFLINE_ADDPARITY"))
+			return raidkm_grow_parity_rotating(devname, fd, devlist,
+							   c, s, array);
+		return raidkm_grow_parity_online(devname, fd, devlist, c, s,
+						 array);
+	}
 
 	/* --- parse and validate the requested geometry (PARITY_N) --- */
 
