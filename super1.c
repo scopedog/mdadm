@@ -1145,6 +1145,11 @@ static void getinfo_super1(struct supertype *st, struct mdinfo *info, char *map)
 
 	if (sb->feature_map & __le32_to_cpu(MD_FEATURE_RESHAPE_ACTIVE)) {
 		info->reshape_active = 1;
+		/* raidkm reshapes (e.g. add-parity) are COW-staged and self-recover
+		 * from the in-kernel journal on assembly, so they need no userspace
+		 * critical-section backup file. */
+		if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM)
+			info->reshape_active |= RESHAPE_NO_BACKUP;
 		if ((sb->feature_map & __le32_to_cpu(MD_FEATURE_NEW_OFFSET)) &&
 		    sb->new_offset != 0)
 			info->reshape_active |= RESHAPE_NO_BACKUP;
