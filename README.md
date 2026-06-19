@@ -1,8 +1,8 @@
 > **Build note:** This is one component of the raidkm mdraid stack and is not
 > meant to be built on its own. Please use
-> [mdraid-super](https://github.com/scopedog/mdraid-super) to build the entire
-> package — it assembles this repo together with the other components in the
-> correct order.
+> [mdraid-super](https://github.com/TheLustreCollective/mdraid-super) to build
+> the entire package — it assembles this repo together with the other
+> components in the correct order.
 
 **mdadm** is a utility used to create and manage **software RAID** devices implemented through
 **Multiple devices driver (MD)** in kernel. It supports following RAID metadata formats:
