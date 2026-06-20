@@ -1,6 +1,6 @@
 > **Build note:** This is one component of the raidkm mdraid stack and is not
 > meant to be built on its own. Please use
-> [mdraid-super](https://github.com/TheLustreCollective/mdraid-super) to build
+> [mdraid-super](https://github.com/scopedog/mdraid-super) to build
 > the entire package — it assembles this repo together with the other
 > components in the correct order.
 
