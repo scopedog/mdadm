@@ -1044,8 +1044,9 @@ int main(int argc, char *argv[])
 			devmode = 'S';
 			continue;
 		case O(MANAGE,AddJournal): /* add journal */
-			if (s.journaldisks && (s.level < 4 || s.level > 6)) {
-				pr_err("--add-journal is only supported for RAID level 4/5/6.\n");
+			if (s.journaldisks && (s.level < 4 || s.level > 6) &&
+			    s.level != LEVEL_RAIDKM) {
+				pr_err("--add-journal is only supported for RAID level 4/5/6 or raidkm.\n");
 				exit(2);
 			}
 			devmode = 'j';
@@ -1327,8 +1328,8 @@ int main(int argc, char *argv[])
 	}
 
 	if (s.journaldisks) {
-		if (s.level < 4 || s.level > 6) {
-			pr_err("--write-journal is only supported for RAID level 4/5/6.\n");
+		if ((s.level < 4 || s.level > 6) && s.level != LEVEL_RAIDKM) {
+			pr_err("--write-journal is only supported for RAID level 4/5/6 or raidkm.\n");
 			exit(2);
 		}
 		if (s.consistency_policy != CONSISTENCY_POLICY_UNKNOWN &&
