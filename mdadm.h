@@ -1977,7 +1977,7 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
 #define	LEVEL_FAULTY		(-5)
 
 /* raidkm: out-of-tree k+m Reed-Solomon md personality (effective raid6).
- * Uses the 'layout' field to carry both m (number of parity disks, 2..8) in
+ * Uses the 'layout' field to carry both m (number of parity disks, 2..16) in
  * its low byte and a parity-placement selector in bit 8:
  *   bit 8 clear -> PARITY_N (dedicated parity at the tail; cheap grow)
  *   bit 8 set   -> rotating parity (spreads parity/reads across all disks)
@@ -1985,8 +1985,8 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
  */
 #define	LEVEL_RAIDKM		(71)
 #define	RAIDKM_MIN_M		(2)
-#define	RAIDKM_MAX_M		(8)
-#define	RAIDKM_MAX_DISKS	(32)
+#define	RAIDKM_MAX_M		(16)
+#define	RAIDKM_MAX_DISKS	(255)
 #define	RAIDKM_LAYOUT_M_MASK	(0x00ff)
 #define	RAIDKM_LAYOUT_ROTATING	(0x0100)
 #define	RAIDKM_LAYOUT_M(layout)	((layout) & RAIDKM_LAYOUT_M_MASK)
