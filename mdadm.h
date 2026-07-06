@@ -522,6 +522,7 @@ enum special_options {
 	NoFailFast,
 	Layout,
 	ParityCount,	/* raidkm: number of parity disks (m); replaces packing m into --layout */
+	Integrity,	/* raidkm: native per-block checksum (--integrity=crc32c) */
 	Auto,
 	Force,
 	SuperMinor,
@@ -706,6 +707,7 @@ struct shape {
 	 * `layout` at create time.  Both default to UnSet; see Create.c. */
 	int	parity_count;		/* m (parity disks); UnSet = default RAIDKM_MIN_M */
 	int	raidkm_rotating;	/* UnSet = default rotating; 0 = parity-last; 1 = rotating */
+	int	raidkm_csum;		/* UnSet/0 = off; 1 = native CRC-32C (--integrity) */
 	int	chunk;
 	int	bitmap_chunk;
 	enum bitmap_type btype;
@@ -1981,6 +1983,8 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
  * its low byte and a parity-placement selector in bit 8:
  *   bit 8 clear -> PARITY_N (dedicated parity at the tail; cheap grow)
  *   bit 8 set   -> rotating parity (spreads parity/reads across all disks)
+ * Bit 9 (RAIDKM_LAYOUT_CSUM, --integrity=crc32c) flags a reserved tail region
+ * of per-block CRC-32C checksums that persist across assemble.
  * --layout=N picks PARITY_N; --layout=Nr (or N-rotating) picks rotating.
  */
 #define	LEVEL_RAIDKM		(71)
@@ -1989,6 +1993,7 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
 #define	RAIDKM_MAX_DISKS	(255)
 #define	RAIDKM_LAYOUT_M_MASK	(0x00ff)
 #define	RAIDKM_LAYOUT_ROTATING	(0x0100)
+#define	RAIDKM_LAYOUT_CSUM	(0x0200)	/* native per-block CRC-32C (--integrity) */
 #define	RAIDKM_LAYOUT_M(layout)	((layout) & RAIDKM_LAYOUT_M_MASK)
 
 /* kernel module doesn't know about these */

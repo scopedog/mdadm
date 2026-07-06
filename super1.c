@@ -550,6 +550,8 @@ static void examine_super1(struct supertype *st, char *homehost)
 		printf("         Layout : %s\n",
 		       (rkl & RAIDKM_LAYOUT_ROTATING) ? "rotating" : "parity-last");
 		printf("   Parity Count : %d\n", RAIDKM_LAYOUT_M(rkl));
+		if (rkl & RAIDKM_LAYOUT_CSUM)
+			printf("      Integrity : crc32c (native per-block)\n");
 	}
 	switch(__le32_to_cpu(sb->level)) {
 	case 0:
@@ -2126,6 +2128,22 @@ static int write_init_super1(struct supertype *st)
 
 			sb->data_offset = __cpu_to_le64(data_offset);
 			sb->data_size = __cpu_to_le64(dsize - data_offset);
+			/* raidkm --integrity: reserve a tail region for per-block
+			 * CRC-32C (4 B / 4 KiB block = data_size/1024 sectors,
+			 * rounded to a 4 KiB / 8-sector boundary).  The kernel
+			 * derives the region from data_offset+data_size .. device
+			 * end.  Clamp the component size so it stays <= data_size. */
+			if (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_CSUM) {
+				unsigned long long usable = dsize - data_offset;
+				unsigned long long region = ROUND_UP(usable / 1024, 8);
+
+				if (usable > region) {
+					usable -= region;
+					sb->data_size = __cpu_to_le64(usable);
+					if (__le64_to_cpu(sb->size) > usable)
+						sb->size = __cpu_to_le64(usable);
+				}
+			}
 			if (data_offset >= sb_offset+bm_offset+bm_space+8) {
 				sb->bblog_size = __cpu_to_le16(8);
 				sb->bblog_offset = __cpu_to_le32(bm_offset +

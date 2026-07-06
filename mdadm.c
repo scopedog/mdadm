@@ -114,6 +114,7 @@ int main(int argc, char *argv[])
 		.layout		= UnSet,
 		.parity_count	= UnSet,
 		.raidkm_rotating = UnSet,
+		.raidkm_csum	= UnSet,
 		.bitmap_chunk	= UnSet,
 		.consistency_policy	= CONSISTENCY_POLICY_UNKNOWN,
 		.data_offset = INVALID_SECTORS,
@@ -716,6 +717,15 @@ int main(int argc, char *argv[])
 					RAIDKM_MIN_M, RAIDKM_MAX_M, optarg);
 				exit(2);
 			}
+			continue;
+
+		case O(CREATE,Integrity): /* raidkm: --integrity=crc32c */
+			if (strcmp(optarg, "crc32c") != 0) {
+				pr_err("--integrity only supports 'crc32c', not %s\n",
+					optarg);
+				exit(2);
+			}
+			s.raidkm_csum = 1;
 			continue;
 
 		case O(CREATE,AssumeClean):

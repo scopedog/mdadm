@@ -577,7 +577,8 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 			       RAIDKM_MIN_M, RAIDKM_MAX_M);
 			return 1;
 		}
-		s->layout = m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0);
+		s->layout = m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0)
+			      | (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
 		if (s->raiddisks <= m) {
 			pr_err("raidkm needs at least %d raid-devices for m=%d (one or more data disks plus %d parity)\n",
 			       m + 1, m, m);
