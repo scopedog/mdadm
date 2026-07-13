@@ -2129,13 +2129,20 @@ static int write_init_super1(struct supertype *st)
 			sb->data_offset = __cpu_to_le64(data_offset);
 			sb->data_size = __cpu_to_le64(dsize - data_offset);
 			/* raidkm --integrity: reserve a tail region for per-block
-			 * CRC-32C (4 B / 4 KiB block = data_size/1024 sectors,
-			 * rounded to a 4 KiB / 8-sector boundary).  The kernel
-			 * derives the region from data_offset+data_size .. device
-			 * end.  Clamp the component size so it stays <= data_size. */
+			 * CRC-32C.  Each 4 KiB region page holds 1022 block CRCs
+			 * plus an 8-byte {self_crc,gen} trailer (km/raid_km.c
+			 * RAIDKM_CSUM_PER_PAGE), so one 4 KiB data block (8 sectors)
+			 * costs one slot and the region is ceil(blocks/1022) pages.
+			 * 1022/page is the 4 KiB-PAGE_SIZE worst case; a larger
+			 * PAGE_SIZE packs more slots per page, so this over-reserves
+			 * safely.  The kernel derives the region from
+			 * data_offset+data_size .. device end.  Clamp the component
+			 * size so it stays <= data_size. */
 			if (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_CSUM) {
 				unsigned long long usable = dsize - data_offset;
-				unsigned long long region = ROUND_UP(usable / 1024, 8);
+				unsigned long long blocks = usable / 8;
+				unsigned long long region =
+					(blocks + 1021) / 1022 * 8;
 
 				if (usable > region) {
 					usable -= region;
