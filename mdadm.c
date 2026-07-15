@@ -719,9 +719,12 @@ int main(int argc, char *argv[])
 			}
 			continue;
 
-		case O(CREATE,Integrity): /* raidkm: --integrity=crc32c */
-			if (strcmp(optarg, "crc32c") != 0) {
-				pr_err("--integrity only supports 'crc32c', not %s\n",
+		case O(CREATE,Integrity): /* raidkm: --checksum[=crc32c] (alias: --integrity=crc32c) */
+			/* Bare --checksum defaults to crc32c (optarg == NULL); a supplied
+			 * value must be crc32c.  --integrity is required_argument, so its
+			 * optarg is always set — only --checksum can arrive bare here. */
+			if (optarg && strcmp(optarg, "crc32c") != 0) {
+				pr_err("native checksum only supports 'crc32c', not %s\n",
 					optarg);
 				exit(2);
 			}

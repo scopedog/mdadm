@@ -130,7 +130,8 @@ struct option long_options[] = {
 	{"layout", 1, 0, Layout},
 	{"parity-count", 1, 0, ParityCount}, /* raidkm: number of parity disks (m) */
 	{"parities", 1, 0, ParityCount},     /* raidkm: alias for --parity-count */
-	{"integrity", 1, 0, Integrity},      /* raidkm: native per-block CRC-32C */
+	{"checksum", 2, 0, Integrity},       /* raidkm: native per-block checksum; bare = crc32c */
+	{"integrity", 1, 0, Integrity},      /* raidkm: alias of --checksum (per-block CRC-32C) */
 	{"raid-disks", 1, 0, 'n'},
 	{"raid-devices", 1, 0, 'n'},
 	{"spare-disks", 1, 0, 'x'},
@@ -323,7 +324,8 @@ char Help_create[] =
 "  --layout=             : same as --parity, for RAID10: [fno]NN,\n"
 "                          for raidkm: rotating (default) or parity-last\n"
 "  --parity-count=        : raidkm: number of parity disks (m); default 2\n"
-"  --integrity=crc32c     : raidkm: native per-block CRC-32C self-healing\n"
+"  --checksum[=crc32c]    : raidkm: native per-block CRC-32C integrity + self-healing\n"
+"                          (bare --checksum = crc32c; --integrity=crc32c is an alias)\n"
 "  --raid-devices=    -n : number of active devices in array\n"
 "  --spare-devices=   -x : number of spare (eXtra) devices in initial array\n"
 "  --size=            -z : Size (in K) of each drive in RAID1/4/5/6/10 - optional\n"

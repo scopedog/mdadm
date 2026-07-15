@@ -551,7 +551,7 @@ static void examine_super1(struct supertype *st, char *homehost)
 		       (rkl & RAIDKM_LAYOUT_ROTATING) ? "rotating" : "parity-last");
 		printf("   Parity Count : %d\n", RAIDKM_LAYOUT_M(rkl));
 		if (rkl & RAIDKM_LAYOUT_CSUM)
-			printf("      Integrity : crc32c (native per-block)\n");
+			printf("       Checksum : crc32c (native per-block)\n");
 	}
 	switch(__le32_to_cpu(sb->level)) {
 	case 0:
@@ -2128,7 +2128,7 @@ static int write_init_super1(struct supertype *st)
 
 			sb->data_offset = __cpu_to_le64(data_offset);
 			sb->data_size = __cpu_to_le64(dsize - data_offset);
-			/* raidkm --integrity: reserve a tail region for per-block
+			/* raidkm --checksum: reserve a tail region for per-block
 			 * CRC-32C.  Each 4 KiB region page holds 1022 block CRCs
 			 * plus an 8-byte {self_crc,gen} trailer (km/raid_km.c
 			 * RAIDKM_CSUM_PER_PAGE), so one 4 KiB data block (8 sectors)
