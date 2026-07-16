@@ -132,6 +132,10 @@ struct option long_options[] = {
 	{"parities", 1, 0, ParityCount},     /* raidkm: alias for --parity-count */
 	{"checksum", 2, 0, Integrity},       /* raidkm: native per-block checksum; bare = crc32c */
 	{"integrity", 1, 0, Integrity},      /* raidkm: alias of --checksum (per-block CRC-32C) */
+	{"group-width", 1, 0, GroupWidth},   /* raidkm declustered: g = k + m */
+	{"spare-columns", 1, 0, SpareColumns}, /* raidkm declustered: spares/row */
+	{"dcl-nbase", 1, 0, DclNbase},       /* raidkm declustered: base perms */
+	{"dcl-seed", 1, 0, DclSeed},         /* raidkm declustered: pin the seed */
 	{"raid-disks", 1, 0, 'n'},
 	{"raid-devices", 1, 0, 'n'},
 	{"spare-disks", 1, 0, 'x'},
@@ -322,10 +326,13 @@ char Help_create[] =
 "  --level=           -l : raid level: 0,1,4,5,6,10,linear,multipath and synonyms\n"
 "  --parity=          -p : raid5/6 parity algorithm: {left,right}-{,a}symmetric\n"
 "  --layout=             : same as --parity, for RAID10: [fno]NN,\n"
-"                          for raidkm: rotating (default) or parity-last\n"
+"                          for raidkm: rotating (default), parity-last,\n"
+"                          or declustered (needs --group-width)\n"
 "  --parity-count=        : raidkm: number of parity disks (m); default 2\n"
 "  --checksum[=crc32c]    : raidkm: native per-block CRC-32C integrity + self-healing\n"
 "                          (bare --checksum = crc32c; --integrity=crc32c is an alias)\n"
+"  --group-width=         : raidkm declustered: group width g = k+m (stripe span)\n"
+"  --spare-columns=       : raidkm declustered: distributed spare columns per row\n"
 "  --raid-devices=    -n : number of active devices in array\n"
 "  --spare-devices=   -x : number of spare (eXtra) devices in initial array\n"
 "  --size=            -z : Size (in K) of each drive in RAID1/4/5/6/10 - optional\n"

@@ -24,6 +24,7 @@
 
 #include <stddef.h>
 #include "mdadm.h"
+#include "raidkm-dcl.h"
 #include "xmalloc.h"
 
 /*
@@ -548,8 +549,16 @@ static void examine_super1(struct supertype *st, char *homehost)
 	if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM) {
 		unsigned int rkl = __le32_to_cpu(sb->layout);
 		printf("         Layout : %s\n",
+		       (rkl & RAIDKM_LAYOUT_DCL) ? "declustered" :
 		       (rkl & RAIDKM_LAYOUT_ROTATING) ? "rotating" : "parity-last");
 		printf("   Parity Count : %d\n", RAIDKM_LAYOUT_M(rkl));
+		if (rkl & RAIDKM_LAYOUT_DCL)
+			printf("    Declustered : g=%u (k=%u+m=%u), %u spare column(s)/row\n",
+			       (unsigned int)RAIDKM_LAYOUT_DCL_G(rkl),
+			       (unsigned int)(RAIDKM_LAYOUT_DCL_G(rkl) -
+					      RAIDKM_LAYOUT_M(rkl)),
+			       (unsigned int)RAIDKM_LAYOUT_M(rkl),
+			       (unsigned int)RAIDKM_LAYOUT_DCL_S(rkl));
 		if (rkl & RAIDKM_LAYOUT_CSUM)
 			printf("       Checksum : crc32c (native per-block)\n");
 	}
@@ -1980,6 +1989,37 @@ static bool has_raid0_layout(struct mdp_superblock_1 *sb)
 		return false;
 }
 
+/* raidkm declustered: write the rkdcl metadata block (permutation seed +
+ * nbase — what the packed layout word cannot carry) into the reserved
+ * tail chunk at data_offset + data_size.  One identical copy per member. */
+static int write_init_rkdcl(struct supertype *st, int fd)
+{
+	struct mdp_superblock_1 *sb = st->sb;
+	unsigned long long off = (__le64_to_cpu(sb->data_offset) +
+				  __le64_to_cpu(sb->data_size)) << 9;
+	unsigned int layout = __le32_to_cpu(sb->layout);
+	void *buf;
+	int ret = 0;
+
+	if (!st->rkdcl_seed || !st->rkdcl_nbase) {
+		pr_err("declustered create without a permutation seed (internal error)\n");
+		return 1;
+	}
+	if (posix_memalign(&buf, 4096, RKDCL_SB_BYTES) != 0)
+		return 1;
+	rkdcl_build_sb(buf, __le32_to_cpu(sb->raid_disks),
+		       RAIDKM_LAYOUT_DCL_G(layout),
+		       layout & RAIDKM_LAYOUT_M_MASK,
+		       RAIDKM_LAYOUT_DCL_S(layout),
+		       st->rkdcl_nbase, st->rkdcl_seed);
+	if (pwrite(fd, buf, RKDCL_SB_BYTES, off) != RKDCL_SB_BYTES) {
+		pr_err("failed to write the declustered metadata block\n");
+		ret = 1;
+	}
+	free(buf);
+	return ret;
+}
+
 static int write_init_super1(struct supertype *st)
 {
 	struct mdp_superblock_1 *sb = st->sb;
@@ -2138,7 +2178,8 @@ static int write_init_super1(struct supertype *st)
 			 * safely.  The kernel derives the region from
 			 * data_offset+data_size .. device end.  Clamp the component
 			 * size so it stays <= data_size. */
-			if (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_CSUM) {
+			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+			    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_CSUM)) {
 				unsigned long long usable = dsize - data_offset;
 				unsigned long long blocks = usable / 8;
 				unsigned long long region =
@@ -2146,6 +2187,28 @@ static int write_init_super1(struct supertype *st)
 
 				if (usable > region) {
 					usable -= region;
+					sb->data_size = __cpu_to_le64(usable);
+					if (__le64_to_cpu(sb->size) > usable)
+						sb->size = __cpu_to_le64(usable);
+				}
+			}
+			/* raidkm declustered: reserve one chunk at the tail
+			 * for the rkdcl metadata block (permutation seed +
+			 * nbase; later the Phase-3 spare-assignment table).
+			 * The kernel finds it at data_offset + data_size.
+			 * Mutually exclusive with --checksum (Create refuses),
+			 * so the two reserves never stack. */
+			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+			    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL)) {
+				unsigned long long usable =
+					__le64_to_cpu(sb->data_size);
+				unsigned long long reserve =
+					__le32_to_cpu(sb->chunksize);
+
+				if (reserve < 8)
+					reserve = 8;
+				if (usable > reserve * 2) {
+					usable -= reserve;
 					sb->data_size = __cpu_to_le64(usable);
 					if (__le64_to_cpu(sb->size) > usable)
 						sb->size = __cpu_to_le64(usable);
@@ -2204,6 +2267,11 @@ static int write_init_super1(struct supertype *st)
 			st->ss->getinfo_super(st, &info, NULL);
 			rv = st->ss->write_init_ppl(st, &info, di->fd);
 		}
+
+		if (rv == 0 &&
+		    __le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+		    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL))
+			rv = write_init_rkdcl(st, di->fd);
 
 		close(di->fd);
 		di->fd = -1;

@@ -23,6 +23,7 @@
  */
 
 #include	"mdadm.h"
+#include	"raidkm-dcl.h"
 #include	"md_u.h"
 #include	"md_p.h"
 #include	"udev.h"
@@ -577,12 +578,61 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 			       RAIDKM_MIN_M, RAIDKM_MAX_M);
 			return 1;
 		}
-		s->layout = m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0)
-			      | (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
-		if (s->raiddisks <= m) {
-			pr_err("raidkm needs at least %d raid-devices for m=%d (one or more data disks plus %d parity)\n",
-			       m + 1, m, m);
-			return 1;
+		if (s->raidkm_declustered == 1) {
+			/* Declustered: groups of g = k+m scattered over the
+			 * N-disk pool with distributed spare columns.  mdadm
+			 * owns the permutation acceptance search; the seed
+			 * travels to super1 via st->rkdcl_* and lands in the
+			 * on-disk rkdcl metadata block. */
+			unsigned int N = s->raiddisks, g, sc, nbase, ngroups;
+
+			if (s->raidkm_rotating != UnSet) {
+				pr_err("--layout=declustered supplies its own placement; do not combine with rotating/parity-last\n");
+				return 1;
+			}
+			if (s->raidkm_csum == 1) {
+				pr_err("declustered + native checksums (--checksum) are not supported together yet\n");
+				return 1;
+			}
+			if (s->dcl_group_width == UnSet) {
+				pr_err("declustered layout requires --group-width=<k+m> (the stripe span; --raid-devices is the pool)\n");
+				return 1;
+			}
+			g = s->dcl_group_width;
+			sc = (s->dcl_spare_cols != UnSet) ?
+				(unsigned int)s->dcl_spare_cols :
+				rkdcl_default_spares(N, g);
+			if (s->dcl_spare_cols == UnSet)
+				printf("mdadm: declustered: defaulting to %u spare column(s) per row\n",
+				       sc);
+			if (sc > 127) {
+				pr_err("declustered spare-column count %u exceeds 127\n", sc);
+				return 1;
+			}
+			nbase = (s->dcl_nbase != UnSet) ?
+				(unsigned int)s->dcl_nbase : 16;
+			if (rkdcl_validate_geometry(N, g, m, sc, &ngroups))
+				return 1;
+			if (!s->dcl_seed) {
+				uint64_t seed;
+
+				if (rkdcl_accept_seed(N, g, m, sc, nbase,
+						      1, 64, &seed))
+					return 1;
+				s->dcl_seed = seed;
+			}
+			s->dcl_spare_cols = sc;
+			s->dcl_nbase = nbase;
+			s->layout = m | RAIDKM_LAYOUT_DCL |
+				    (g << 16) | (sc << 24);
+		} else {
+			s->layout = m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0)
+				      | (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
+			if (s->raiddisks <= m) {
+				pr_err("raidkm needs at least %d raid-devices for m=%d (one or more data disks plus %d parity)\n",
+				       m + 1, m, m);
+				return 1;
+			}
 		}
 		if (s->raiddisks > RAIDKM_MAX_DISKS) {
 			pr_err("no more than %d raid-devices supported for raidkm\n",
@@ -1172,6 +1222,11 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 				name += 2;
 		}
 	}
+	/* raidkm declustered: hand the accepted permutation seed to super1
+	 * (written into the on-disk rkdcl metadata block per member) */
+	st->rkdcl_seed = (s->raidkm_declustered == 1) ? s->dcl_seed : 0;
+	st->rkdcl_nbase = (s->raidkm_declustered == 1) ?
+			  (unsigned int)s->dcl_nbase : 0;
 	if (!st->ss->init_super(st, &info.array, s, name, c->homehost, uuid,
 				s->data_offset))
 		goto abort_locked;

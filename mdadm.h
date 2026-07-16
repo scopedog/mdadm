@@ -523,6 +523,10 @@ enum special_options {
 	Layout,
 	ParityCount,	/* raidkm: number of parity disks (m); replaces packing m into --layout */
 	Integrity,	/* raidkm: native per-block checksum (--checksum / --integrity) */
+	GroupWidth,	/* raidkm declustered: group width g = k + m */
+	SpareColumns,	/* raidkm declustered: spare columns per row */
+	DclNbase,	/* raidkm declustered: base permutations (default 16) */
+	DclSeed,	/* raidkm declustered: pin the permutation seed (skips search) */
 	Auto,
 	Force,
 	SuperMinor,
@@ -708,6 +712,11 @@ struct shape {
 	int	parity_count;		/* m (parity disks); UnSet = default RAIDKM_MIN_M */
 	int	raidkm_rotating;	/* UnSet = default rotating; 0 = parity-last; 1 = rotating */
 	int	raidkm_csum;		/* UnSet/0 = off; 1 = native CRC-32C (--checksum) */
+	int	raidkm_declustered;	/* UnSet/0 = off; 1 = --layout=declustered */
+	int	dcl_group_width;	/* g = k + m; required when declustered */
+	int	dcl_spare_cols;		/* s; UnSet = auto (N mod g, or g) */
+	int	dcl_nbase;		/* base permutations; UnSet = 16 */
+	unsigned long long dcl_seed;	/* 0 = run the acceptance search */
 	int	chunk;
 	int	bitmap_chunk;
 	enum bitmap_type btype;
@@ -1403,6 +1412,8 @@ struct supertype {
 	void *other; /* Hack used to convert v0.90 to v1.0 */
 	unsigned long long devsize;
 	unsigned long long data_offset; /* used by v1.x only */
+	unsigned long long rkdcl_seed;	/* raidkm declustered: create-time seed */
+	unsigned int rkdcl_nbase;	/* raidkm declustered: base permutations */
 	int ignore_hw_compat; /* used to inform metadata handlers that it should ignore
 				 HW/firmware related incompatability to load metadata.
 				 Used when examining metadata to display content of disk
@@ -1994,6 +2005,14 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
 #define	RAIDKM_LAYOUT_M_MASK	(0x00ff)
 #define	RAIDKM_LAYOUT_ROTATING	(0x0100)
 #define	RAIDKM_LAYOUT_CSUM	(0x0200)	/* native per-block CRC-32C (--checksum) */
+/* Declustered parity (bit 10): stripes of width g = k+m scattered over the
+ * N-disk pool with distributed spare columns; g in bits 16-23, spare-column
+ * count in bits 24-30 (s <= 127 keeps the int layout word positive).  nbase
+ * and the 64-bit permutation seed live in the on-disk metadata block at
+ * data_offset + data_size (see raidkm-dcl.h struct rkdcl_sb). */
+#define	RAIDKM_LAYOUT_DCL	(0x0400)
+#define	RAIDKM_LAYOUT_DCL_G(l)	(((l) >> 16) & 0xff)
+#define	RAIDKM_LAYOUT_DCL_S(l)	(((l) >> 24) & 0x7f)
 #define	RAIDKM_LAYOUT_M(layout)	((layout) & RAIDKM_LAYOUT_M_MASK)
 
 /* kernel module doesn't know about these */

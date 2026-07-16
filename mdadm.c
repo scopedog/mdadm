@@ -115,6 +115,11 @@ int main(int argc, char *argv[])
 		.parity_count	= UnSet,
 		.raidkm_rotating = UnSet,
 		.raidkm_csum	= UnSet,
+		.raidkm_declustered = UnSet,
+		.dcl_group_width = UnSet,
+		.dcl_spare_cols	= UnSet,
+		.dcl_nbase	= UnSet,
+		.dcl_seed	= 0,
 		.bitmap_chunk	= UnSet,
 		.consistency_policy	= CONSISTENCY_POLICY_UNKNOWN,
 		.data_offset = INVALID_SECTORS,
@@ -653,6 +658,13 @@ int main(int argc, char *argv[])
 					s.raidkm_rotating = 0;
 					break;
 				}
+				if (strcasecmp(optarg, "declustered") == 0) {
+					/* placement comes from the declustered
+					 * map; geometry via --group-width /
+					 * --spare-columns (see Create.c) */
+					s.raidkm_declustered = 1;
+					break;
+				}
 				/* legacy numeric "N" / "Nr" / "N-rotating" */
 				{
 					int rotating = 0, m;
@@ -729,6 +741,42 @@ int main(int argc, char *argv[])
 				exit(2);
 			}
 			s.raidkm_csum = 1;
+			continue;
+
+		case O(CREATE,GroupWidth): /* raidkm declustered: g = k + m */
+			if (parse_num(&s.dcl_group_width, optarg) != 0 ||
+			    s.dcl_group_width < 3 || s.dcl_group_width > 255) {
+				pr_err("--group-width must be an integer in [3..255], not %s\n",
+					optarg);
+				exit(2);
+			}
+			continue;
+
+		case O(CREATE,SpareColumns): /* raidkm declustered: spares/row */
+			if (parse_num(&s.dcl_spare_cols, optarg) != 0 ||
+			    s.dcl_spare_cols < 1 || s.dcl_spare_cols > 127) {
+				pr_err("--spare-columns must be an integer in [1..127], not %s\n",
+					optarg);
+				exit(2);
+			}
+			continue;
+
+		case O(CREATE,DclNbase): /* raidkm declustered: base perms */
+			if (parse_num(&s.dcl_nbase, optarg) != 0 ||
+			    s.dcl_nbase < 1 || s.dcl_nbase > 64) {
+				pr_err("--dcl-nbase must be an integer in [1..64], not %s\n",
+					optarg);
+				exit(2);
+			}
+			continue;
+
+		case O(CREATE,DclSeed): /* raidkm declustered: pin the seed */
+			s.dcl_seed = strtoull(optarg, NULL, 0);
+			if (!s.dcl_seed) {
+				pr_err("--dcl-seed must be a non-zero integer, not %s\n",
+					optarg);
+				exit(2);
+			}
 			continue;
 
 		case O(CREATE,AssumeClean):

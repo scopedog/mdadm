@@ -158,7 +158,7 @@ LDFLAGS ?= -pie -Wl,-z,now,-z,noexecstack
 # If you want a static binary, you might uncomment these
 # LDFLAGS += -static
 # STRIP = -s
-LDLIBS = -ldl
+LDLIBS = -ldl -lm
 
 # To explicitly disable libudev, set -DNO_LIBUDEV in CXFLAGS
 ifeq (, $(findstring -DNO_LIBUDEV,  $(CXFLAGS)))
@@ -191,7 +191,7 @@ OBJS = mdadm.o config.o policy.o mdstat.o  ReadMe.o uuid.o util.o maps.o lib.o u
        mdopen.o super0.o super1.o super-ddf.o super-intel.o bitmap.o \
        super-mbr.o super-gpt.o \
        restripe.o sysfs.o sha1.o mapfile.o crc32.o msg.o xmalloc.o \
-       platform-intel.o probe_roms.o crc32c.o drive_encryption.o
+       platform-intel.o probe_roms.o crc32c.o drive_encryption.o raidkm-dcl.o
 
 CHECK_OBJS = restripe.o uuid.o sysfs.o maps.o lib.o xmalloc.o dlink.o
 
