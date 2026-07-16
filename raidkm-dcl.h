@@ -22,12 +22,20 @@
  * (rkdcl_build_sb uses __cpu_to_le*); the kernel reads with le*_to_cpu.
  * Versioned for the Phase-3 spare-assignment table. */
 #define RKDCL_MAGIC		"RKDCLMD1"
-#define RKDCL_SB_VERSION	1
+#define RKDCL_SB_VERSION	1	/* geometry only		*/
+#define RKDCL_SB_VERSION2	2	/* + spare assignment (kernel-
+					 * written, Phase 3)		*/
 #define RKDCL_SB_BYTES		4096
+
+/* v2 assignment states (mdadm only displays these) */
+#define RKDCL_NO_ASSIGN		(~0U)
+#define RKDCL_ASSIGN_NONE	0
+#define RKDCL_ASSIGN_POPULATING	1
+#define RKDCL_ASSIGN_POPULATED	2
 
 struct rkdcl_sb {
 	char		magic[8];	/* RKDCL_MAGIC, no NUL		*/
-	uint32_t	version;	/* RKDCL_SB_VERSION		*/
+	uint32_t	version;	/* RKDCL_SB_VERSION{,2}		*/
 	uint32_t	hdr_crc;	/* crc32-le of the 4 KiB block
 					 * with this field zeroed	*/
 	uint32_t	pool_disks;	/* N — cross-check vs SB	*/
@@ -38,6 +46,14 @@ struct rkdcl_sb {
 	uint32_t	nbase;		/* base permutations		*/
 	uint64_t	seed;		/* accepted permutation seed	*/
 	uint64_t	flags;		/* 0				*/
+	/* ---- v2 fields (zero in v1 blocks) ------------------------- */
+	uint64_t	gen;		/* journal generation		*/
+	uint32_t	assign_disk;	/* X, or RKDCL_NO_ASSIGN	*/
+	uint32_t	assign_spare;	/* spare column j		*/
+	uint32_t	assign_state;	/* RKDCL_ASSIGN_*		*/
+	uint32_t	pad0;
+	uint64_t	assign_mark;	/* journaled rebuild mark
+					 * (device sectors)		*/
 	/* pad to RKDCL_SB_BYTES */
 };
 
@@ -62,5 +78,11 @@ int rkdcl_accept_seed(unsigned int N, unsigned int g, unsigned int m,
 void rkdcl_build_sb(void *buf, unsigned int N, unsigned int g,
 		    unsigned int m, unsigned int s, unsigned int nbase,
 		    uint64_t seed);
+
+/* Parse + validate an on-disk rkdcl block (inverse of rkdcl_build_sb).
+ * Returns 0 and sets the nbase/seed out-params, or -1 if invalid. */
+int rkdcl_parse_sb(const void *buf, unsigned int N, unsigned int g,
+		   unsigned int m, unsigned int s,
+		   unsigned int *nbase, uint64_t *seed);
 
 #endif /* RAIDKM_DCL_H */

@@ -1414,6 +1414,11 @@ struct supertype {
 	unsigned long long data_offset; /* used by v1.x only */
 	unsigned long long rkdcl_seed;	/* raidkm declustered: create-time seed */
 	unsigned int rkdcl_nbase;	/* raidkm declustered: base permutations */
+	void *rkdcl_blk;		/* raidkm declustered: verbatim rkdcl
+					 * block read off the loaded member —
+					 * --add clones it to the new member
+					 * (preserves the kernel's v2 spare-
+					 * assignment journal) */
 	int ignore_hw_compat; /* used to inform metadata handlers that it should ignore
 				 HW/firmware related incompatability to load metadata.
 				 Used when examining metadata to display content of disk

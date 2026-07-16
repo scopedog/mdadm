@@ -2007,17 +2007,60 @@ static int write_init_rkdcl(struct supertype *st, int fd)
 	}
 	if (posix_memalign(&buf, 4096, RKDCL_SB_BYTES) != 0)
 		return 1;
-	rkdcl_build_sb(buf, __le32_to_cpu(sb->raid_disks),
-		       RAIDKM_LAYOUT_DCL_G(layout),
-		       layout & RAIDKM_LAYOUT_M_MASK,
-		       RAIDKM_LAYOUT_DCL_S(layout),
-		       st->rkdcl_nbase, st->rkdcl_seed);
+	if (st->rkdcl_blk)
+		/* non-create writer (--add): clone the loaded member's block
+		 * verbatim — preserves the kernel's v2 assignment journal */
+		memcpy(buf, st->rkdcl_blk, RKDCL_SB_BYTES);
+	else
+		rkdcl_build_sb(buf, __le32_to_cpu(sb->raid_disks),
+			       RAIDKM_LAYOUT_DCL_G(layout),
+			       layout & RAIDKM_LAYOUT_M_MASK,
+			       RAIDKM_LAYOUT_DCL_S(layout),
+			       st->rkdcl_nbase, st->rkdcl_seed);
 	if (pwrite(fd, buf, RKDCL_SB_BYTES, off) != RKDCL_SB_BYTES) {
 		pr_err("failed to write the declustered metadata block\n");
 		ret = 1;
 	}
 	free(buf);
 	return ret;
+}
+
+/* raidkm declustered: recover the permutation seed + nbase into st->rkdcl_*
+ * from a member's on-disk rkdcl block, so metadata writers OUTSIDE create —
+ * --add of a replacement disk clones a live member's metadata via
+ * load_super1 and then runs write_init_rkdcl for the new member — have the
+ * seed available.  Best-effort: an unreadable/invalid block just leaves
+ * st->rkdcl_* unset and write_init_rkdcl reports the hard error. */
+static void load_rkdcl1(struct supertype *st, int fd)
+{
+	struct mdp_superblock_1 *sb = st->sb;
+	unsigned int layout = __le32_to_cpu(sb->layout);
+	unsigned long long off = (__le64_to_cpu(sb->data_offset) +
+				  __le64_to_cpu(sb->data_size)) << 9;
+	unsigned int nbase;
+	uint64_t seed;
+	void *buf;
+
+	if (__le32_to_cpu(sb->level) != LEVEL_RAIDKM ||
+	    !(layout & RAIDKM_LAYOUT_DCL))
+		return;
+	if (posix_memalign(&buf, 4096, RKDCL_SB_BYTES) != 0)
+		return;
+	if (pread(fd, buf, RKDCL_SB_BYTES, off) == RKDCL_SB_BYTES &&
+	    rkdcl_parse_sb(buf, __le32_to_cpu(sb->raid_disks),
+			   RAIDKM_LAYOUT_DCL_G(layout),
+			   layout & RAIDKM_LAYOUT_M_MASK,
+			   RAIDKM_LAYOUT_DCL_S(layout),
+			   &nbase, &seed) == 0) {
+		st->rkdcl_nbase = nbase;
+		st->rkdcl_seed = seed;
+		/* keep the raw block: --add clones it verbatim so the
+		 * kernel's v2 spare-assignment journal is preserved */
+		free(st->rkdcl_blk);
+		st->rkdcl_blk = buf;
+		return;
+	}
+	free(buf);
 }
 
 static int write_init_super1(struct supertype *st)
@@ -2478,6 +2521,10 @@ static int load_super1(struct supertype *st, int fd, char *devname)
 		return 2;
 	}
 	st->sb = super;
+
+	/* raidkm declustered: pick up the permutation seed for later
+	 * metadata writes (e.g. --add clones this member's metadata) */
+	load_rkdcl1(st, fd);
 
 	/* Now check on the bitmap superblock */
 	if ((__le32_to_cpu(super->feature_map)&MD_FEATURE_BITMAP_OFFSET) == 0)
@@ -2946,6 +2993,8 @@ static void free_super1(struct supertype *st)
 
 	if (st->sb)
 		free(st->sb);
+	free(st->rkdcl_blk);
+	st->rkdcl_blk = NULL;
 	while (st->info) {
 		struct devinfo *di = st->info;
 		st->info = di->next;

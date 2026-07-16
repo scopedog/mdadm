@@ -271,3 +271,36 @@ void rkdcl_build_sb(void *buf, unsigned int N, unsigned int g,
 	sb->hdr_crc	= 0;
 	sb->hdr_crc	= __cpu_to_le32(rkdcl_crc32(buf, RKDCL_SB_BYTES));
 }
+
+/* Parse + validate an on-disk rkdcl metadata block: magic/version/crc, then
+ * cross-check the geometry against the caller's (from the SB layout word).
+ * The inverse of rkdcl_build_sb.  Returns 0 and sets the nbase/seed
+ * out-params, -1 if the block is not a valid rkdcl block for this geometry. */
+int rkdcl_parse_sb(const void *buf, unsigned int N, unsigned int g,
+		   unsigned int m, unsigned int s,
+		   unsigned int *nbase, uint64_t *seed)
+{
+	const struct rkdcl_sb *sb = buf;
+	unsigned char tmp[RKDCL_SB_BYTES];
+
+	if (memcmp(sb->magic, RKDCL_MAGIC, 8) != 0 ||
+	    __le32_to_cpu(sb->version) < RKDCL_SB_VERSION ||
+	    __le32_to_cpu(sb->version) > RKDCL_SB_VERSION2)
+		return -1;
+	/* crc covers the whole block with hdr_crc zeroed */
+	memcpy(tmp, buf, RKDCL_SB_BYTES);
+	((struct rkdcl_sb *)tmp)->hdr_crc = 0;
+	if (rkdcl_crc32(tmp, RKDCL_SB_BYTES) != __le32_to_cpu(sb->hdr_crc))
+		return -1;
+	if (__le32_to_cpu(sb->pool_disks) != N ||
+	    __le32_to_cpu(sb->group_width) != g ||
+	    __le32_to_cpu(sb->parity) != m ||
+	    __le32_to_cpu(sb->spare_cols) != s ||
+	    __le32_to_cpu(sb->ngroups) != (N - s) / g)
+		return -1;
+	if (!__le32_to_cpu(sb->nbase) || !__le64_to_cpu(sb->seed))
+		return -1;
+	*nbase = __le32_to_cpu(sb->nbase);
+	*seed = __le64_to_cpu(sb->seed);
+	return 0;
+}
