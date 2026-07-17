@@ -2009,7 +2009,7 @@ static int write_init_rkdcl(struct supertype *st, int fd)
 		return 1;
 	if (st->rkdcl_blk)
 		/* non-create writer (--add): clone the loaded member's block
-		 * verbatim — preserves the kernel's v2 assignment journal */
+		 * verbatim — preserves the kernel's v2/v3 assignment journal */
 		memcpy(buf, st->rkdcl_blk, RKDCL_SB_BYTES);
 	else
 		rkdcl_build_sb(buf, __le32_to_cpu(sb->raid_disks),
@@ -2055,7 +2055,7 @@ static void load_rkdcl1(struct supertype *st, int fd)
 		st->rkdcl_nbase = nbase;
 		st->rkdcl_seed = seed;
 		/* keep the raw block: --add clones it verbatim so the
-		 * kernel's v2 spare-assignment journal is preserved */
+		 * kernel's v2/v3 spare-assignment journal is preserved */
 		free(st->rkdcl_blk);
 		st->rkdcl_blk = buf;
 		return;

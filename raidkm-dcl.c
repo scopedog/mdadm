@@ -285,7 +285,7 @@ int rkdcl_parse_sb(const void *buf, unsigned int N, unsigned int g,
 
 	if (memcmp(sb->magic, RKDCL_MAGIC, 8) != 0 ||
 	    __le32_to_cpu(sb->version) < RKDCL_SB_VERSION ||
-	    __le32_to_cpu(sb->version) > RKDCL_SB_VERSION2)
+	    __le32_to_cpu(sb->version) > RKDCL_SB_VERSION3)
 		return -1;
 	/* crc covers the whole block with hdr_crc zeroed */
 	memcpy(tmp, buf, RKDCL_SB_BYTES);

@@ -25,6 +25,8 @@
 #define RKDCL_SB_VERSION	1	/* geometry only		*/
 #define RKDCL_SB_VERSION2	2	/* + spare assignment (kernel-
 					 * written, Phase 3)		*/
+#define RKDCL_SB_VERSION3	3	/* + multi-assignment table
+					 * (Phase 3b; kernel-written)	*/
 #define RKDCL_SB_BYTES		4096
 
 /* v2 assignment states (mdadm only displays these) */
@@ -33,9 +35,25 @@
 #define RKDCL_ASSIGN_POPULATING	1
 #define RKDCL_ASSIGN_POPULATED	2
 
+/* v3 assignment-table entry (24 bytes); capacity = format max s.
+ * ADAPTIVE VERSIONING: the kernel journals v2 while <= 1 assignment is
+ * active and v3 while >= 2 — see km/raid_km_dcl.h for the rationale.
+ * mdadm never interprets the table beyond crc/geometry (--add clones the
+ * reference member's block verbatim); --examine displays the count. */
+#define RKDCL_MAX_ASSIGN	127
+
+struct rkdcl_assign {
+	uint32_t	disk;		/* X_i				*/
+	uint32_t	spare;		/* spare column j_i		*/
+	uint32_t	state;		/* RKDCL_ASSIGN_*		*/
+	uint32_t	pad;
+	uint64_t	mark;		/* journaled rebuild mark
+					 * (device sectors)		*/
+};
+
 struct rkdcl_sb {
 	char		magic[8];	/* RKDCL_MAGIC, no NUL		*/
-	uint32_t	version;	/* RKDCL_SB_VERSION{,2}		*/
+	uint32_t	version;	/* RKDCL_SB_VERSION{,2,3}	*/
 	uint32_t	hdr_crc;	/* crc32-le of the 4 KiB block
 					 * with this field zeroed	*/
 	uint32_t	pool_disks;	/* N — cross-check vs SB	*/
@@ -54,6 +72,11 @@ struct rkdcl_sb {
 	uint32_t	pad0;
 	uint64_t	assign_mark;	/* journaled rebuild mark
 					 * (device sectors)		*/
+	/* ---- v3 fields (zero in v1/v2 blocks; mirror of assign[0]
+	 *      kept in the legacy fields for display) ----------------- */
+	uint32_t	nassign;	/* live entries in assign[]	*/
+	uint32_t	pad1;
+	struct rkdcl_assign assign[RKDCL_MAX_ASSIGN];
 	/* pad to RKDCL_SB_BYTES */
 };
 
