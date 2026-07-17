@@ -34,6 +34,7 @@
 #define RKDCL_ASSIGN_NONE	0
 #define RKDCL_ASSIGN_POPULATING	1
 #define RKDCL_ASSIGN_POPULATED	2
+#define RKDCL_ASSIGN_COPYING	3	/* Phase 4: copying spare -> replacement */
 
 /* v3 assignment-table entry (24 bytes); capacity = format max s.
  * ADAPTIVE VERSIONING: the kernel journals v2 while <= 1 assignment is
