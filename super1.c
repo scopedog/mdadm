@@ -2237,10 +2237,13 @@ static int write_init_super1(struct supertype *st)
 			}
 			/* raidkm declustered: reserve one chunk at the tail
 			 * for the rkdcl metadata block (permutation seed +
-			 * nbase; later the Phase-3 spare-assignment table).
+			 * nbase + the spare-assignment table/journal).
 			 * The kernel finds it at data_offset + data_size.
-			 * Mutually exclusive with --checksum (Create refuses),
-			 * so the two reserves never stack. */
+			 * With --checksum the two reserves STACK: the csum
+			 * clamp above ran first, so the tail ends up
+			 * [rkdcl chunk][CRC region] and the kernel derives
+			 * the CRC region one chunk past dev_sectors
+			 * (km raidkm_csum_region). */
 			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
 			    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL)) {
 				unsigned long long usable =

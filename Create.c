@@ -590,10 +590,6 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 				pr_err("--layout=declustered supplies its own placement; do not combine with rotating/parity-last\n");
 				return 1;
 			}
-			if (s->raidkm_csum == 1) {
-				pr_err("declustered + native checksums (--checksum) are not supported together yet\n");
-				return 1;
-			}
 			if (s->dcl_group_width == UnSet) {
 				pr_err("declustered layout requires --group-width=<k+m> (the stripe span; --raid-devices is the pool)\n");
 				return 1;
@@ -623,8 +619,14 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 			}
 			s->dcl_spare_cols = sc;
 			s->dcl_nbase = nbase;
+			/* --checksum composes with declustered: super1 stacks
+			 * the CRC-region reserve and the rkdcl chunk reserve
+			 * at the tail (csum clamp first, then the dcl chunk),
+			 * and the kernel finds the CRC region one chunk past
+			 * dev_sectors (after the rkdcl block). */
 			s->layout = m | RAIDKM_LAYOUT_DCL |
-				    (g << 16) | (sc << 24);
+				    (g << 16) | (sc << 24) |
+				    (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
 		} else {
 			s->layout = m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0)
 				      | (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
