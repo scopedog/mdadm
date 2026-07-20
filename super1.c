@@ -2243,7 +2243,18 @@ static int write_init_super1(struct supertype *st)
 			 * clamp above ran first, so the tail ends up
 			 * [rkdcl chunk][CRC region] and the kernel derives
 			 * the CRC region one chunk past dev_sectors
-			 * (km raidkm_csum_region). */
+			 * (km raidkm_csum_region).
+			 *
+			 * data_size MUST end up CHUNK-ALIGNED: the kernel
+			 * rounds mddev->dev_sectors down to a chunk multiple
+			 * after setup, and the rkdcl loader reads at
+			 * data_offset + dev_sectors on every later assemble.
+			 * An unaligned data_size (e.g. the csum reserve above
+			 * is a page multiple, not a chunk multiple) makes the
+			 * create-time and assemble-time offsets disagree and
+			 * the array refuses to re-assemble ("no valid rkdcl
+			 * metadata block").  Aligning here makes the kernel's
+			 * rounding a no-op, so both sides agree forever. */
 			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
 			    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL)) {
 				unsigned long long usable =
@@ -2255,6 +2266,7 @@ static int write_init_super1(struct supertype *st)
 					reserve = 8;
 				if (usable > reserve * 2) {
 					usable -= reserve;
+					usable -= usable % reserve;
 					sb->data_size = __cpu_to_le64(usable);
 					if (__le64_to_cpu(sb->size) > usable)
 						sb->size = __cpu_to_le64(usable);
