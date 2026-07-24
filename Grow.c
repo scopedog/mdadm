@@ -24,6 +24,7 @@
 #include	"mdadm.h"
 #include	"dlink.h"
 #include	"xmalloc.h"
+#include	"raidkm-dcl.h"
 
 #include	<sys/mman.h>
 #include	<stddef.h>
@@ -3207,6 +3208,137 @@ out:
 	return rv;
 }
 
+/*
+ * raidkm_dcl_grow() - declustered pool expansion (N -> N'; group width g,
+ * parity m and spare-column count s all fixed).  Widen the disk pool with more
+ * k+m groups per row, growing capacity and rebuild parallelism.  The layout
+ * word is unchanged; mdadm runs the acceptance search for the NEW pool's
+ * permutation seed, adds the new pool disks as spares, and starts the in-kernel
+ * COW pool-expansion reshape (journaled per band, crash-recoverable on
+ * assembly, no backup file).  See md-kmec notes/declustered-reshape-design.md.
+ */
+static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
+			   struct context *c, struct shape *s,
+			   struct mdu_array_info_s *array)
+{
+	int old_n = array->raid_disks;
+	unsigned int g = RAIDKM_LAYOUT_DCL_G(array->layout);
+	unsigned int m = RAIDKM_LAYOUT_M(array->layout);
+	unsigned int sc = RAIDKM_LAYOUT_DCL_S(array->layout);
+	unsigned int nbase = 0, ng_old = 0, ng_new = 0;
+	uint64_t new_seed = 0;
+	int n_added = 0, new_n, rv = 1;
+	struct mddev_dev *dv;
+	struct mdinfo *sra = NULL, *sd;
+	struct supertype *st = NULL;
+	char *subarray = NULL;
+	char trig[64];
+
+	if (s->raidkm_grow == RAIDKM_GROW_PARITY) {
+		pr_err("raidkm grow: declustered add-parity (raise m) is not supported yet; widen the pool with --raid-devices instead\n");
+		return 1;
+	}
+	for (dv = devlist; dv; dv = dv->next)
+		n_added++;
+	new_n = (s->raiddisks > 0) ? s->raiddisks : old_n + n_added;
+	if (new_n <= old_n) {
+		pr_err("raidkm grow: declustered pool expansion must ADD disks (N=%d -> %d)\n",
+		       old_n, new_n);
+		return 1;
+	}
+	if (s->raiddisks > 0 && n_added > 0 && n_added != new_n - old_n) {
+		pr_err("raidkm grow: --raid-devices=%d needs %d new device(s), got %d\n",
+		       new_n, new_n - old_n, n_added);
+		return 1;
+	}
+	if (n_added == 0 && array->spare_disks < new_n - old_n) {
+		pr_err("raidkm grow: supply %d new pool disk(s) on the command line, or --add them as spares first\n",
+		       new_n - old_n);
+		return 1;
+	}
+	if (array->active_disks < old_n) {
+		pr_err("raidkm grow: array is degraded (%d of %d present); rebuild before growing\n",
+		       array->active_disks, old_n);
+		return 1;
+	}
+	if (rkdcl_validate_geometry(new_n, g, m, sc, &ng_new)) {
+		pr_err("raidkm grow: illegal declustered geometry for N'=%d (g=%u, s=%u): need (N'-s) %% g == 0\n",
+		       new_n, g, sc);
+		return 1;
+	}
+	rkdcl_validate_geometry(old_n, g, m, sc, &ng_old);
+
+	/* read the array's nbase from a live member's on-disk rkdcl block
+	 * (load_super1 -> load_rkdcl1 populates st->rkdcl_nbase) */
+	st = super_by_fd(fd, &subarray);
+	sra = sysfs_read(fd, NULL, GET_VERSION | GET_LEVEL | GET_DISKS |
+				   GET_DEVS | GET_STATE);
+	if (!st || !sra) {
+		pr_err("raidkm grow: cannot read metadata/sysfs for %s\n", devname);
+		goto out;
+	}
+	for (sd = sra->devs; sd && !nbase; sd = sd->next) {
+		char *dp = map_dev(sd->disk.major, sd->disk.minor, 0);
+		int dfd = dp ? dev_open(dp, O_RDONLY) : -1;
+
+		if (dfd < 0)
+			continue;
+		if (st->ss->load_super(st, dfd, NULL) == 0 && st->rkdcl_nbase)
+			nbase = st->rkdcl_nbase;
+		st->ss->free_super(st);
+		close(dfd);
+	}
+	if (!nbase) {
+		pr_err("raidkm grow: could not read the declustered nbase from any member of %s\n",
+		       devname);
+		goto out;
+	}
+
+	/* acceptance search for the NEW pool's permutation seed (base 1, 64
+	 * tries, the same scorer --create uses) */
+	if (rkdcl_accept_seed(new_n, g, m, sc, nbase, 1, 64, &new_seed)) {
+		pr_err("raidkm grow: permutation acceptance search failed for N'=%d\n",
+		       new_n);
+		goto out;
+	}
+
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: %s declustered pool expansion N=%d->%d (groups/row %u->%u; g=%u m=%u s=%u), new seed 0x%llx\n",
+		       devname, old_n, new_n, ng_old, ng_new, g, m, sc,
+		       (unsigned long long)new_seed);
+
+	/* 1. add the new pool disks as spares */
+	if (n_added > 0 &&
+	    Manage_subdevs(devname, fd, devlist, c->verbose, 0, UOPT_UNDEFINED,
+			   c->force)) {
+		pr_err("raidkm grow: failed to add the new pool disk(s) to %s\n",
+		       devname);
+		goto out;
+	}
+
+	/* 2. start the in-kernel COW pool-expansion reshape via the rk_dcl_reshape
+	 *    trigger: "<newN>:<seed_hex>".  The kernel validates the geometry,
+	 *    installs the new permutation as conf->dcl (old kept as prev_dcl),
+	 *    admits the added disks In_sync, and runs a journaled per-band
+	 *    migration — recoverable by a plain --assemble after a crash. */
+	snprintf(trig, sizeof(trig), "%d:%llx", new_n,
+		 (unsigned long long)new_seed);
+	if (sysfs_set_str(sra, NULL, "rk_dcl_reshape", trig) < 0) {
+		pr_err("raidkm grow: failed to start the declustered reshape on %s (array busy, or geometry rejected)\n",
+		       devname);
+		goto out;
+	}
+
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: declustered pool expansion started on %s; monitor /proc/mdstat or --detail\n",
+		       devname);
+	rv = 0;
+out:
+	if (sra)
+		sysfs_free(sra);
+	return rv;
+}
+
 int Grow_reshape(char *devname, int fd,
 		 struct mddev_dev *devlist,
 		 struct context *c, struct shape *s)
@@ -3260,6 +3392,10 @@ int Grow_reshape(char *devname, int fd,
 	if (array.level == LEVEL_RAIDKM &&
 	    (s->raidkm_grow != RAIDKM_GROW_UNSET || devlist != NULL ||
 	     s->raiddisks)) {
+		/* declustered: widening the pool (--raid-devices=N') is a
+		 * distinct reshape from classic add-data/add-parity */
+		if (array.layout & RAIDKM_LAYOUT_DCL)
+			return raidkm_dcl_grow(devname, fd, devlist, c, s, &array);
 		if (s->raidkm_grow == RAIDKM_GROW_DATA)
 			return raidkm_grow_data(devname, fd, devlist, c, s, &array);
 		return raidkm_grow_parity(devname, fd, devlist, c, s, &array);
