@@ -578,10 +578,18 @@ int Detail(char *dev, struct context *c)
 		}
 		if (array.level == LEVEL_RAIDKM) {
 			printf("            Layout : %s\n",
+			       (array.layout & RAIDKM_LAYOUT_DCL) ? "declustered" :
 			       (array.layout & RAIDKM_LAYOUT_ROTATING) ?
 			       "rotating" : "parity-last");
 			printf("      Parity Count : %d\n",
 			       RAIDKM_LAYOUT_M(array.layout));
+			if (array.layout & RAIDKM_LAYOUT_DCL)
+				printf("       Declustered : g=%u (k=%u+m=%u), %u spare column(s)/row\n",
+				       (unsigned int)RAIDKM_LAYOUT_DCL_G(array.layout),
+				       (unsigned int)(RAIDKM_LAYOUT_DCL_G(array.layout) -
+						      RAIDKM_LAYOUT_M(array.layout)),
+				       (unsigned int)RAIDKM_LAYOUT_M(array.layout),
+				       (unsigned int)RAIDKM_LAYOUT_DCL_S(array.layout));
 		}
 		switch (array.level) {
 		case 0:

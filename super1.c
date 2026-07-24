@@ -1989,14 +1989,32 @@ static bool has_raid0_layout(struct mdp_superblock_1 *sb)
 		return false;
 }
 
+/* raidkm declustered: byte offset of the rkdcl metadata block.  The KERNEL
+ * reads and rewrites it at data_offset + dev_sectors — the COMPONENT size
+ * (sb->size), chunk-rounded — so the block floats with a member resize
+ * (raid5_resize rewrites it at the new size).  With a defaulted --size the
+ * component size equals the clamped data_size and this matches the old
+ * data_offset + data_size placement exactly; with an explicit smaller
+ * --size only this form agrees with the kernel. */
+static unsigned long long rkdcl_blk_off1(struct mdp_superblock_1 *sb)
+{
+	unsigned long long comp = __le64_to_cpu(sb->size);
+	unsigned int chunk = __le32_to_cpu(sb->chunksize);
+
+	if (!comp)
+		comp = __le64_to_cpu(sb->data_size);
+	if (chunk)
+		comp -= comp % chunk;
+	return (__le64_to_cpu(sb->data_offset) + comp) << 9;
+}
+
 /* raidkm declustered: write the rkdcl metadata block (permutation seed +
  * nbase — what the packed layout word cannot carry) into the reserved
- * tail chunk at data_offset + data_size.  One identical copy per member. */
+ * tail chunk past the component size.  One identical copy per member. */
 static int write_init_rkdcl(struct supertype *st, int fd)
 {
 	struct mdp_superblock_1 *sb = st->sb;
-	unsigned long long off = (__le64_to_cpu(sb->data_offset) +
-				  __le64_to_cpu(sb->data_size)) << 9;
+	unsigned long long off = rkdcl_blk_off1(sb);
 	unsigned int layout = __le32_to_cpu(sb->layout);
 	void *buf;
 	int ret = 0;
@@ -2035,8 +2053,7 @@ static void load_rkdcl1(struct supertype *st, int fd)
 {
 	struct mdp_superblock_1 *sb = st->sb;
 	unsigned int layout = __le32_to_cpu(sb->layout);
-	unsigned long long off = (__le64_to_cpu(sb->data_offset) +
-				  __le64_to_cpu(sb->data_size)) << 9;
+	unsigned long long off = rkdcl_blk_off1(sb);
 	unsigned int nbase;
 	uint64_t seed;
 	void *buf;

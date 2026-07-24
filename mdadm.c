@@ -752,6 +752,7 @@ int main(int argc, char *argv[])
 			}
 			continue;
 
+		case O(GROW,SpareColumns): /* raidkm declustered: change s (spare-count reshape) */
 		case O(CREATE,SpareColumns): /* raidkm declustered: spares/row */
 			if (parse_num(&s.dcl_spare_cols, optarg) != 0 ||
 			    s.dcl_spare_cols < 1 || s.dcl_spare_cols > 127) {
@@ -1781,7 +1782,11 @@ int main(int argc, char *argv[])
 		 *   - bare `--grow --add <disk>` with NO --raid-devices => raidkm
 		 *     shorthand: each added disk becomes one more PARITY.
 		 * An explicit --add-data/--add-parity always wins over this. */
+		/* Declustered arrays are excluded: there a bare --raid-devices /
+		 * --add means POOL EXPANSION (raidkm_dcl_grow), and add-data /
+		 * add-parity are explicit-option-only group-geometry reshapes. */
 		if (array.level == LEVEL_RAIDKM &&
+		    !(array.layout & RAIDKM_LAYOUT_DCL) &&
 		    s.raidkm_grow == RAIDKM_GROW_UNSET) {
 			if (s.raiddisks > 0)
 				s.raidkm_grow = RAIDKM_GROW_DATA;
@@ -1854,7 +1859,9 @@ int main(int argc, char *argv[])
 			rv = Grow_continue_command(ident.devname, mdfd, &c);
 		else if (s.size > 0 || s.raiddisks || s.layout_str ||
 			 s.chunk != 0 || s.level != UnSet ||
-			 s.data_offset != INVALID_SECTORS) {
+			 s.data_offset != INVALID_SECTORS ||
+			 s.raidkm_grow != RAIDKM_GROW_UNSET ||
+			 s.dcl_spare_cols != UnSet /* raidkm dcl reshapes */) {
 			rv = Grow_reshape(ident.devname, mdfd, devlist->next, &c, &s);
 		} else if (s.consistency_policy != CONSISTENCY_POLICY_UNKNOWN) {
 			rv = Grow_consistency_policy(ident.devname, mdfd, &c, &s);

@@ -550,6 +550,13 @@ char Help_grow[] =
 "  --data-offset=        : Location on device to move start of data to.\n"
 "  --consistency-policy= : Change the consistency policy of an active array.\n"
 "                     -k : Currently works only for PPL with RAID5.\n"
+"  --add-parity          : raidkm: add one parity disk (m -> m+1); declustered:\n"
+"                        : one new parity column per group (adds ngroups disks,\n"
+"                        : offline-only)\n"
+"  --add-data            : raidkm: add data disk(s); declustered: one new data\n"
+"                        : column per group (adds ngroups disks, offline-only)\n"
+"  --spare-columns=      : raidkm declustered: change the distributed spare-\n"
+"                        : column count (decrease only; offline-only)\n"
 ;
 
 char Help_incr[] =

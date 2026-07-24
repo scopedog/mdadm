@@ -3209,13 +3209,26 @@ out:
 }
 
 /*
- * raidkm_dcl_grow() - declustered pool expansion (N -> N'; group width g,
- * parity m and spare-column count s all fixed).  Widen the disk pool with more
- * k+m groups per row, growing capacity and rebuild parallelism.  The layout
- * word is unchanged; mdadm runs the acceptance search for the NEW pool's
- * permutation seed, adds the new pool disks as spares, and starts the in-kernel
- * COW pool-expansion reshape (journaled per band, crash-recoverable on
- * assembly, no backup file).  See md-kmec notes/declustered-reshape-design.md.
+ * raidkm_dcl_grow() - declustered reshapes, all driven through the kernel's
+ * rk_dcl_reshape trigger ("<N'>:<seed_hex>[:<layout_hex>]"):
+ *
+ *   pool expansion (--raid-devices=N' / bare --add):  N -> N'; g/m/s fixed,
+ *     layout word unchanged.  Fully ONLINE; adds N'-N disks (one or more whole
+ *     k+m groups per row), growing capacity and rebuild parallelism.
+ *   --add-parity:  g -> g+1, m -> m+1; adds ngroups disks (one new parity
+ *     column per group), capacity unchanged.  OFFLINE-ONLY.
+ *   --add-data:    g -> g+1, k -> k+1; adds ngroups disks (one new data
+ *     column per group), capacity grows.  OFFLINE-ONLY.
+ *   --spare-columns=s':  s -> s' (decrease only); N/g/m fixed, no disks added
+ *     (delta_disks == 0), ngroups and capacity grow.  OFFLINE-ONLY.
+ *
+ * mdadm runs the acceptance search for the NEW geometry's permutation seed,
+ * adds any new pool disks as spares, and starts the in-kernel COW reshape
+ * (journaled per band, crash-recoverable on assembly, no backup file).  The
+ * kernel enforces the offline-only rule for every layout-word-changing kind
+ * (openers > 0 => -EBUSY); mdadm closes its own handles around the trigger
+ * write so it does not count against that.  See md-kmec
+ * notes/declustered-reshape-design.md.
  */
 static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 			   struct context *c, struct shape *s,
@@ -3225,30 +3238,84 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 	unsigned int g = RAIDKM_LAYOUT_DCL_G(array->layout);
 	unsigned int m = RAIDKM_LAYOUT_M(array->layout);
 	unsigned int sc = RAIDKM_LAYOUT_DCL_S(array->layout);
+	unsigned int new_g = g, new_m = m, new_sc = sc;
 	unsigned int nbase = 0, ng_old = 0, ng_new = 0;
+	int new_layout, layout_change;
 	uint64_t new_seed = 0;
 	int n_added = 0, new_n, rv = 1;
+	const char *kindname;
 	struct mddev_dev *dv;
 	struct mdinfo *sra = NULL, *sd;
 	struct supertype *st = NULL;
 	char *subarray = NULL;
-	char trig[64];
+	char trig[80];
 
-	if (s->raidkm_grow == RAIDKM_GROW_PARITY) {
-		pr_err("raidkm grow: declustered add-parity (raise m) is not supported yet; widen the pool with --raid-devices instead\n");
-		return 1;
-	}
+	rkdcl_validate_geometry(old_n, g, m, sc, &ng_old);
 	for (dv = devlist; dv; dv = dv->next)
 		n_added++;
-	new_n = (s->raiddisks > 0) ? s->raiddisks : old_n + n_added;
-	if (new_n <= old_n) {
-		pr_err("raidkm grow: declustered pool expansion must ADD disks (N=%d -> %d)\n",
-		       old_n, new_n);
-		return 1;
+
+	if (s->raidkm_grow == RAIDKM_GROW_PARITY ||
+	    s->raidkm_grow == RAIDKM_GROW_DATA) {
+		/* add-parity / add-data: one new column per group => g+1 and
+		 * ngroups new disks; parity count follows for add-parity. */
+		int want = s->raidkm_grow == RAIDKM_GROW_PARITY;
+
+		kindname = want ? "add-parity" : "add-data";
+		if (s->dcl_spare_cols != UnSet) {
+			pr_err("raidkm grow: --%s cannot be combined with --spare-columns\n",
+			       kindname);
+			return 1;
+		}
+		new_g = g + 1;
+		new_m = want ? m + 1 : m;
+		new_n = old_n + ng_old;
+		if (s->raiddisks > 0 && s->raiddisks != new_n) {
+			pr_err("raidkm grow: declustered %s adds one disk per group (%u): N %d -> %d; --raid-devices=%d conflicts\n",
+			       kindname, ng_old, old_n, new_n, s->raiddisks);
+			return 1;
+		}
+	} else if (s->dcl_spare_cols != UnSet) {
+		/* spare-count change: s -> s' on a fixed pool */
+		kindname = "spare-count";
+		new_sc = s->dcl_spare_cols;
+		new_n = old_n;
+		if (n_added || s->raiddisks > 0) {
+			pr_err("raidkm grow: --spare-columns changes s on the existing pool; do not add disks or pass --raid-devices\n");
+			return 1;
+		}
+		if (new_sc == sc) {
+			pr_err("raidkm grow: %s already has %u spare column(s)\n",
+			       devname, sc);
+			return 1;
+		}
+		if (new_sc > sc) {
+			pr_err("raidkm grow: raising the spare-column count (%u -> %u) shrinks capacity; capacity-shrinking reshapes are not supported\n",
+			       sc, new_sc);
+			return 1;
+		}
+	} else {
+		/* pool expansion (the original path) */
+		kindname = "pool expansion";
+		new_n = (s->raiddisks > 0) ? s->raiddisks : old_n + n_added;
+		if (new_n <= old_n) {
+			pr_err("raidkm grow: declustered pool expansion must ADD disks (N=%d -> %d)\n",
+			       old_n, new_n);
+			return 1;
+		}
+		if (s->raiddisks > 0 && n_added > 0 && n_added != new_n - old_n) {
+			pr_err("raidkm grow: --raid-devices=%d needs %d new device(s), got %d\n",
+			       new_n, new_n - old_n, n_added);
+			return 1;
+		}
 	}
-	if (s->raiddisks > 0 && n_added > 0 && n_added != new_n - old_n) {
-		pr_err("raidkm grow: --raid-devices=%d needs %d new device(s), got %d\n",
-		       new_n, new_n - old_n, n_added);
+	new_layout = (int)(new_m | RAIDKM_LAYOUT_DCL |
+			   ((unsigned int)array->layout & RAIDKM_LAYOUT_CSUM) |
+			   (new_g << 16) | (new_sc << 24));
+	layout_change = new_layout != array->layout;
+
+	if (n_added > 0 && n_added != new_n - old_n) {
+		pr_err("raidkm grow: declustered %s needs exactly %d new device(s), got %d\n",
+		       kindname, new_n - old_n, n_added);
 		return 1;
 	}
 	if (n_added == 0 && array->spare_disks < new_n - old_n) {
@@ -3261,12 +3328,11 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 		       array->active_disks, old_n);
 		return 1;
 	}
-	if (rkdcl_validate_geometry(new_n, g, m, sc, &ng_new)) {
-		pr_err("raidkm grow: illegal declustered geometry for N'=%d (g=%u, s=%u): need (N'-s) %% g == 0\n",
-		       new_n, g, sc);
+	if (rkdcl_validate_geometry(new_n, new_g, new_m, new_sc, &ng_new)) {
+		pr_err("raidkm grow: illegal declustered geometry for N'=%d (g=%u, m=%u, s=%u): need (N'-s) %% g == 0\n",
+		       new_n, new_g, new_m, new_sc);
 		return 1;
 	}
-	rkdcl_validate_geometry(old_n, g, m, sc, &ng_old);
 
 	/* read the array's nbase from a live member's on-disk rkdcl block
 	 * (load_super1 -> load_rkdcl1 populates st->rkdcl_nbase) */
@@ -3294,17 +3360,19 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 		goto out;
 	}
 
-	/* acceptance search for the NEW pool's permutation seed (base 1, 64
+	/* acceptance search for the NEW geometry's permutation seed (base 1, 64
 	 * tries, the same scorer --create uses) */
-	if (rkdcl_accept_seed(new_n, g, m, sc, nbase, 1, 64, &new_seed)) {
+	if (rkdcl_accept_seed(new_n, new_g, new_m, new_sc, nbase, 1, 64,
+			      &new_seed)) {
 		pr_err("raidkm grow: permutation acceptance search failed for N'=%d\n",
 		       new_n);
 		goto out;
 	}
 
 	if (c->verbose >= 0)
-		pr_err("raidkm grow: %s declustered pool expansion N=%d->%d (groups/row %u->%u; g=%u m=%u s=%u), new seed 0x%llx\n",
-		       devname, old_n, new_n, ng_old, ng_new, g, m, sc,
+		pr_err("raidkm grow: %s declustered %s N=%d->%d g=%u->%u m=%u->%u s=%u->%u (groups/row %u->%u), new seed 0x%llx\n",
+		       devname, kindname, old_n, new_n, g, new_g, m, new_m,
+		       sc, new_sc, ng_old, ng_new,
 		       (unsigned long long)new_seed);
 
 	/* 1. add the new pool disks as spares */
@@ -3316,23 +3384,96 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 		goto out;
 	}
 
-	/* 2. start the in-kernel COW pool-expansion reshape via the rk_dcl_reshape
-	 *    trigger: "<newN>:<seed_hex>".  The kernel validates the geometry,
-	 *    installs the new permutation as conf->dcl (old kept as prev_dcl),
-	 *    admits the added disks In_sync, and runs a journaled per-band
-	 *    migration — recoverable by a plain --assemble after a crash. */
-	snprintf(trig, sizeof(trig), "%d:%llx", new_n,
-		 (unsigned long long)new_seed);
-	if (sysfs_set_str(sra, NULL, "rk_dcl_reshape", trig) < 0) {
-		pr_err("raidkm grow: failed to start the declustered reshape on %s (array busy, or geometry rejected)\n",
-		       devname);
-		goto out;
+	/* 2. start the in-kernel COW reshape via the rk_dcl_reshape trigger:
+	 *    "<newN>:<seed_hex>[:<layout_hex>]" (the layout word only when it
+	 *    changes — add-parity/add-data/spare-count).  The kernel validates
+	 *    the geometry, installs the new permutation as conf->dcl (old kept
+	 *    as prev_dcl), admits any added disks In_sync, and runs a journaled
+	 *    per-band migration — recoverable by a plain --assemble after a
+	 *    crash.
+	 *
+	 *    The layout-changing kinds are OFFLINE-ONLY: the kernel refuses
+	 *    them while the array has open block-device handles — and OUR fd is
+	 *    one.  Prove the array is otherwise idle by re-opening O_EXCL, then
+	 *    close both handles around the sysfs write (sysfs paths in @sra do
+	 *    not need the block device).  A user slipping a mount into that
+	 *    window is caught by the kernel's openers check (-EBUSY). */
+	if (layout_change) {
+		int xfd = open(devname, O_RDONLY | O_EXCL);
+
+		if (xfd < 0) {
+			pr_err("raidkm grow: declustered %s is offline-only and %s is in use — unmount / close it and retry\n",
+			       kindname, devname);
+			goto out;
+		}
+		close(xfd);
+		close(fd);
+		snprintf(trig, sizeof(trig), "%d:%llx:%x", new_n,
+			 (unsigned long long)new_seed,
+			 (unsigned int)new_layout);
+	} else {
+		snprintf(trig, sizeof(trig), "%d:%llx", new_n,
+			 (unsigned long long)new_seed);
+	}
+	{
+		int tries = layout_change ? 12 : 1;
+		int ok = -1;
+
+		/* udev transiently opens the md device to re-probe after the
+		 * spare adds above; a layout-changing (offline-only) kind
+		 * would see that as an opener and -EBUSY.  Retry briefly so a
+		 * settling probe cannot fail an otherwise-idle array; a real
+		 * user (mount / open fd) persists and still fails below.
+		 * Write the attribute directly (not sysfs_set_str) so the
+		 * retries are silent and errno is trustworthy. */
+		while (tries--) {
+			char path[PATH_MAX];
+			int afd;
+
+			snprintf(path, sizeof(path),
+				 "/sys/block/%s/md/rk_dcl_reshape",
+				 sra->sys_name);
+			afd = open(path, O_WRONLY);
+			if (afd < 0)
+				break;
+			ok = write(afd, trig, strlen(trig)) ==
+				(ssize_t)strlen(trig) ? 0 : -1;
+			{
+				int saved = errno;
+
+				close(afd);	/* must not clobber errno */
+				errno = saved;
+			}
+			if (ok == 0 || errno != EBUSY || !tries)
+				break;
+			sleep_for(0, MSEC_TO_NSEC(250), true);
+		}
+		if (ok < 0) {
+			pr_err("raidkm grow: failed to start the declustered %s on %s (%s)\n",
+			       kindname, devname,
+			       errno == EBUSY ?
+			       (layout_change ?
+				"offline-only: the array is in use — unmount / close every handle and retry"
+				: "array busy — a reshape or resync is already running")
+			       : "geometry rejected by the kernel");
+			goto reopen;
+		}
 	}
 
 	if (c->verbose >= 0)
-		pr_err("raidkm grow: declustered pool expansion started on %s; monitor /proc/mdstat or --detail\n",
-		       devname);
+		pr_err("raidkm grow: declustered %s started on %s; monitor /proc/mdstat or --detail\n",
+		       kindname, devname);
 	rv = 0;
+reopen:
+	/* restore the caller's fd number so its eventual close() stays valid */
+	if (layout_change) {
+		int nfd = open(devname, O_RDONLY);
+
+		if (nfd >= 0 && nfd != fd) {
+			dup2(nfd, fd);
+			close(nfd);
+		}
+	}
 out:
 	if (sra)
 		sysfs_free(sra);
@@ -3391,7 +3532,9 @@ int Grow_reshape(char *devname, int fd,
 	 * (which drives the kernel's raid5_resize for level 71). */
 	if (array.level == LEVEL_RAIDKM &&
 	    (s->raidkm_grow != RAIDKM_GROW_UNSET || devlist != NULL ||
-	     s->raiddisks)) {
+	     s->raiddisks ||
+	     ((array.layout & RAIDKM_LAYOUT_DCL) &&
+	      s->dcl_spare_cols != UnSet))) {
 		/* declustered: widening the pool (--raid-devices=N') is a
 		 * distinct reshape from classic add-data/add-parity */
 		if (array.layout & RAIDKM_LAYOUT_DCL)
