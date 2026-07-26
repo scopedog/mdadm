@@ -1815,6 +1815,25 @@ error:
 }
 
 /*
+ * A filesystem records the RAID geometry once at mkfs time (ext4/ldiskfs:
+ * -E stride/stripe_width -> superblock s_raid_* -> mballoc s_stripe) and
+ * never re-reads the device topology, so a k-changing grow silently leaves
+ * it aligning and sizing allocations to the OLD full-stripe width — every
+ * large write then straddles stripes and pays read-modify-write.  Remind
+ * the operator to refresh the recorded geometry once the reshape completes.
+ * Stride math assumes the common 4 KiB filesystem block.
+ */
+static void raidkm_fs_geometry_reminder(char *devname, int new_k, int chunk)
+{
+	if (chunk <= 0 || chunk % 4096)
+		return;
+	pr_err("raidkm grow: NOTE: filesystems record the RAID stripe geometry at mkfs time and will NOT notice this change.  After the reshape completes, refresh it (4KiB-block ext4/ldiskfs):\n");
+	pr_err("raidkm grow:       tune2fs -E stride=%d,stripe_width=%d %s   (effective at next mount; or online: mount -o remount,stripe=%d <mntpt>)\n",
+	       chunk / 4096, chunk / 4096 * new_k, devname,
+	       chunk / 4096 * new_k);
+}
+
+/*
  * raidkm_grow_data() - add data disk(s) to a raidkm (level 71) array, growing
  * capacity at a FIXED parity count m (k -> k + n_added).
  *
@@ -1948,9 +1967,12 @@ static int raidkm_grow_data(char *devname, int fd, struct mddev_dev *devlist,
 		goto out_unfreeze;
 	}
 
-	if (c->verbose >= 0)
+	if (c->verbose >= 0) {
 		pr_err("raidkm grow: reshape started on %s; monitor with /proc/mdstat or --detail\n",
 		       devname);
+		raidkm_fs_geometry_reminder(devname, old_k + (new_n - old_n),
+					    array->chunk_size);
+	}
 	sysfs_free(sra);
 	return 0;
 
@@ -3460,9 +3482,14 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 		}
 	}
 
-	if (c->verbose >= 0)
+	if (c->verbose >= 0) {
 		pr_err("raidkm grow: declustered %s started on %s; monitor /proc/mdstat or --detail\n",
 		       kindname, devname);
+		/* only add-data changes the k-cell row width the fs aligns to */
+		if (s->raidkm_grow == RAIDKM_GROW_DATA)
+			raidkm_fs_geometry_reminder(devname, new_g - new_m,
+						    array->chunk_size);
+	}
 	rv = 0;
 reopen:
 	/* restore the caller's fd number so its eventual close() stays valid */
