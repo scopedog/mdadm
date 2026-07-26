@@ -1815,7 +1815,7 @@ error:
 }
 
 /*
- * A filesystem records the RAID geometry once at mkfs time (ext4/ldiskfs:
+ * A filesystem records the RAID geometry once at mkfs time (ext4:
  * -E stride/stripe_width -> superblock s_raid_* -> mballoc s_stripe) and
  * never re-reads the device topology, so a k-changing grow silently leaves
  * it aligning and sizing allocations to the OLD full-stripe width — every
@@ -1827,7 +1827,7 @@ static void raidkm_fs_geometry_reminder(char *devname, int new_k, int chunk)
 {
 	if (chunk <= 0 || chunk % 4096)
 		return;
-	pr_err("raidkm grow: NOTE: filesystems record the RAID stripe geometry at mkfs time and will NOT notice this change.  After the reshape completes, refresh it (4KiB-block ext4/ldiskfs):\n");
+	pr_err("raidkm grow: NOTE: filesystems record the RAID stripe geometry at mkfs time and will NOT notice this change.  After the reshape completes, refresh it (4KiB-block ext4):\n");
 	pr_err("raidkm grow:       tune2fs -E stride=%d,stripe_width=%d %s   (effective at next mount; or online: mount -o remount,stripe=%d <mntpt>)\n",
 	       chunk / 4096, chunk / 4096 * new_k, devname,
 	       chunk / 4096 * new_k);
