@@ -3238,19 +3238,21 @@ out:
  *     layout word unchanged.  Fully ONLINE; adds N'-N disks (one or more whole
  *     k+m groups per row), growing capacity and rebuild parallelism.
  *   --add-parity:  g -> g+1, m -> m+1; adds ngroups disks (one new parity
- *     column per group), capacity unchanged.  OFFLINE-ONLY.
+ *     column per group), capacity unchanged.
  *   --add-data:    g -> g+1, k -> k+1; adds ngroups disks (one new data
- *     column per group), capacity grows.  OFFLINE-ONLY.
+ *     column per group), capacity grows.
  *   --spare-columns=s':  s -> s' (decrease only); N/g/m fixed, no disks added
- *     (delta_disks == 0), ngroups and capacity grow.  OFFLINE-ONLY.
+ *     (delta_disks == 0), ngroups and capacity grow.
  *
  * mdadm runs the acceptance search for the NEW geometry's permutation seed,
  * adds any new pool disks as spares, and starts the in-kernel COW reshape
- * (journaled per band, crash-recoverable on assembly, no backup file).  The
- * kernel enforces the offline-only rule for every layout-word-changing kind
- * (openers > 0 => -EBUSY); mdadm closes its own handles around the trigger
- * write so it does not count against that.  See md-kmec
- * notes/declustered-reshape-design.md.
+ * (journaled per band, crash-recoverable on assembly, no backup file).  All
+ * kinds run ONLINE — the kernel serves the un-migrated region with
+ * previous-geometry stripes — EXCEPT on a NATIVE-CSUM array, where every
+ * layout-word-changing kind is offline-only (openers > 0 => -EBUSY; the CRC
+ * re-key is not validated against concurrent writes) and mdadm closes its
+ * own handles around the trigger write so it does not count against that.
+ * See md-kmec notes/declustered-reshape-design.md §7b.
  */
 static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 			   struct context *c, struct shape *s,
@@ -3262,7 +3264,7 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 	unsigned int sc = RAIDKM_LAYOUT_DCL_S(array->layout);
 	unsigned int new_g = g, new_m = m, new_sc = sc;
 	unsigned int nbase = 0, ng_old = 0, ng_new = 0;
-	int new_layout, layout_change;
+	int new_layout, layout_change, offline_only;
 	uint64_t new_seed = 0;
 	int n_added = 0, new_n, rv = 1;
 	const char *kindname;
@@ -3334,6 +3336,10 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 			   ((unsigned int)array->layout & RAIDKM_LAYOUT_CSUM) |
 			   (new_g << 16) | (new_sc << 24));
 	layout_change = new_layout != array->layout;
+	/* only a NATIVE-CSUM array's layout-changing reshape is offline-only
+	 * (kernel §7b policy); everything else runs online */
+	offline_only = layout_change &&
+		       ((unsigned int)array->layout & RAIDKM_LAYOUT_CSUM);
 
 	if (n_added > 0 && n_added != new_n - old_n) {
 		pr_err("raidkm grow: declustered %s needs exactly %d new device(s), got %d\n",
@@ -3414,40 +3420,48 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 	 *    per-band migration — recoverable by a plain --assemble after a
 	 *    crash.
 	 *
-	 *    The layout-changing kinds are OFFLINE-ONLY: the kernel refuses
-	 *    them while the array has open block-device handles — and OUR fd is
-	 *    one.  Prove the array is otherwise idle by re-opening O_EXCL, then
-	 *    close both handles around the sysfs write (sysfs paths in @sra do
-	 *    not need the block device).  A user slipping a mount into that
-	 *    window is caught by the kernel's openers check (-EBUSY). */
-	if (layout_change) {
+	 *    A NATIVE-CSUM array's layout-changing kinds are OFFLINE-ONLY: the
+	 *    kernel refuses them while the array has open block-device handles
+	 *    — and OUR fd is one.  Prove the array is otherwise idle by
+	 *    re-opening O_EXCL, then close both handles around the sysfs write
+	 *    (sysfs paths in @sra do not need the block device).  A user
+	 *    slipping a mount into that window is caught by the kernel's
+	 *    openers check (-EBUSY).  Every other kind runs online — no probe,
+	 *    our fd stays open. */
+	if (offline_only) {
 		int xfd = open(devname, O_RDONLY | O_EXCL);
 
 		if (xfd < 0) {
-			pr_err("raidkm grow: declustered %s is offline-only and %s is in use — unmount / close it and retry\n",
+			pr_err("raidkm grow: declustered %s is offline-only on a native-checksum array and %s is in use — unmount / close it and retry\n",
 			       kindname, devname);
 			goto out;
 		}
 		close(xfd);
 		close(fd);
+	}
+	if (layout_change)
 		snprintf(trig, sizeof(trig), "%d:%llx:%x", new_n,
 			 (unsigned long long)new_seed,
 			 (unsigned int)new_layout);
-	} else {
+	else
 		snprintf(trig, sizeof(trig), "%d:%llx", new_n,
 			 (unsigned long long)new_seed);
-	}
 	{
-		int tries = layout_change ? 12 : 1;
+		int tries = 40;
 		int ok = -1;
 
-		/* udev transiently opens the md device to re-probe after the
-		 * spare adds above; a layout-changing (offline-only) kind
-		 * would see that as an opener and -EBUSY.  Retry briefly so a
-		 * settling probe cannot fail an otherwise-idle array; a real
-		 * user (mount / open fd) persists and still fails below.
-		 * Write the attribute directly (not sysfs_set_str) so the
-		 * retries are silent and errno is trustworthy. */
+		/* Two transient -EBUSY sources right after the spare adds
+		 * above: md briefly sets MD_RECOVERY_RUNNING while it decides
+		 * the new spares have nothing to rebuild (every kind), and
+		 * udev's re-probe opens the device, which the offline-only
+		 * (csum) kinds count as an opener.  Retry briefly (~10s at
+		 * 250ms — the recovery probe can take several seconds on a
+		 * slow or instrumented kernel) so neither can fail an
+		 * otherwise-ready array; a real blocker (running
+		 * reshape/resync, or a mount on a csum array) persists and
+		 * still fails below.  Write the attribute directly (not
+		 * sysfs_set_str) so the retries are silent and errno is
+		 * trustworthy. */
 		while (tries--) {
 			char path[PATH_MAX];
 			int afd;
@@ -3474,7 +3488,7 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 			pr_err("raidkm grow: failed to start the declustered %s on %s (%s)\n",
 			       kindname, devname,
 			       errno == EBUSY ?
-			       (layout_change ?
+			       (offline_only ?
 				"offline-only: the array is in use — unmount / close every handle and retry"
 				: "array busy — a reshape or resync is already running")
 			       : "geometry rejected by the kernel");
@@ -3493,7 +3507,7 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 	rv = 0;
 reopen:
 	/* restore the caller's fd number so its eventual close() stays valid */
-	if (layout_change) {
+	if (offline_only) {
 		int nfd = open(devname, O_RDONLY);
 
 		if (nfd >= 0 && nfd != fd) {
