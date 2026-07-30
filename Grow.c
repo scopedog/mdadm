@@ -2943,6 +2943,115 @@ out:
 }
 
 /*
+ * raidkm_shrink_data() - remove ONE data disk (k -> k-1, m and layout fixed)
+ * from a raidkm (level 71) array via the in-kernel BACKWARD COW reshape
+ * (journaled per band, crash-recoverable by a plain --assemble, no backup
+ * file).  v1 removes exactly one disk per invocation.
+ *
+ * The array size must ALREADY be clamped to the shrunk capacity (shrink the
+ * filesystem first, then `--grow --array-size=<kb>`); the exact value is
+ * computed and printed on refusal.  The kernel enforces the same gate at
+ * start_reshape, this just makes the failure actionable.  On completion the
+ * freed member becomes a spare: remove it with --remove and clear it with
+ * --zero-superblock before reuse (it still holds a readable pre-shrink copy).
+ */
+static int raidkm_shrink_data(char *devname, int fd, struct context *c,
+			      struct shape *s, struct mdu_array_info_s *array)
+{
+	int old_n = array->raid_disks, new_n = s->raiddisks;
+	int m = RAIDKM_LAYOUT_M(array->layout);
+	struct mdinfo *sra = NULL;
+	unsigned long long cur_bytes = 0, new_cap_kb, dev_kb;
+	int froze = 0, rv = 1;
+
+	if (array->layout & RAIDKM_LAYOUT_DCL) {
+		pr_err("raidkm shrink: declustered pool shrink is not supported\n");
+		return 1;
+	}
+	if (new_n != old_n - 1) {
+		pr_err("raidkm shrink: exactly one data disk is removed per reshape (%d -> %d requested); repeat for a larger reduction\n",
+		       old_n, new_n);
+		return 1;
+	}
+	if (new_n - m < 2) {
+		pr_err("raidkm shrink: need at least 2 data disks (m=%d, --raid-devices=%d leaves %d)\n",
+		       m, new_n, new_n - m);
+		return 1;
+	}
+	if (array->active_disks < old_n || array->failed_disks) {
+		pr_err("raidkm shrink: array is degraded (%d of %d present); heal it first\n",
+		       array->active_disks, old_n);
+		return 1;
+	}
+
+	sra = sysfs_read(fd, NULL, GET_VERSION | GET_LEVEL | GET_DISKS |
+			 GET_COMPONENT);
+	if (!sra) {
+		pr_err("raidkm shrink: cannot read sysfs state for %s\n", devname);
+		return 1;
+	}
+	dev_kb = sra->component_size / 2;	/* sectors -> KiB */
+	new_cap_kb = dev_kb * (unsigned long long)(new_n - m);
+	if (!get_dev_size(fd, NULL, &cur_bytes)) {
+		pr_err("raidkm shrink: cannot read the current array size of %s\n",
+		       devname);
+		goto out;
+	}
+	if (cur_bytes / 1024 > new_cap_kb) {
+		pr_err("raidkm shrink: %s exposes %llu KiB but %d data disks hold only %llu KiB.\n",
+		       devname, cur_bytes / 1024, new_n - m, new_cap_kb);
+		pr_err("raidkm shrink: shrink the filesystem to <= %llu KiB first, then run:\n",
+		       new_cap_kb);
+		pr_err("raidkm shrink:     mdadm --grow %s --array-size=%llu\n",
+		       devname, new_cap_kb);
+		pr_err("raidkm shrink: and retry (--array-size is an in-core clamp, reversible until the shrink runs)\n");
+		goto out;
+	}
+
+	if (c->verbose >= 0)
+		pr_err("raidkm shrink: %s k=%d->%d (raid-devices %d->%d, m=%d fixed) via online backward COW reshape\n",
+		       devname, old_n - m, new_n - m, old_n, new_n, m);
+
+	froze = sysfs_freeze_array(sra);
+	if (froze < 0) {
+		pr_err("raidkm shrink: %s is busy (resync/reshape in progress); retry when idle\n",
+		       devname);
+		goto out;
+	}
+
+	/* stage delta_disks = -1 (update_raid_disks -> check_reshape v1 gates) */
+	if (sysfs_set_num(sra, NULL, "raid_disks", new_n) != 0) {
+		pr_err("raidkm shrink: failed to set raid_disks=%d; reshape NOT started\n",
+		       new_n);
+		goto out_unfreeze;
+	}
+	/* start it (clears the freeze).  No backup file: the COW journal makes
+	 * a crash recoverable on assembly. */
+	if (sysfs_set_str(sra, NULL, "sync_action", "reshape") < 0) {
+		pr_err("raidkm shrink: failed to start the reshape on %s\n", devname);
+		goto out_unfreeze;
+	}
+
+	if (c->verbose >= 0) {
+		pr_err("raidkm shrink: reshape started on %s; monitor /proc/mdstat or --detail\n",
+		       devname);
+		pr_err("raidkm shrink: when it completes, the freed member becomes a spare — remove it with --remove and clear it with --zero-superblock before reuse\n");
+		raidkm_fs_geometry_reminder(devname, new_n - m,
+					    array->chunk_size);
+	}
+	rv = 0;
+	goto out;
+
+out_unfreeze:
+	if (froze > 0)
+		sysfs_set_str(sra, NULL, "sync_action", "idle");
+out:
+	if (sra)
+		sysfs_free(sra);
+	return rv;
+}
+
+/*
  * raidkm_grow_parity() - add parity disk(s) to a raidkm (level 71) array.
  *
  * raidkm keeps data on disks [0, raid_disks - m) and never relocates it
@@ -3541,6 +3650,10 @@ int Grow_reshape(char *devname, int fd,
 		 * distinct reshape from classic add-data/add-parity */
 		if (array.layout & RAIDKM_LAYOUT_DCL)
 			return raidkm_dcl_grow(devname, fd, devlist, c, s, &array);
+		/* a raid-devices DECREASE is shrink-data (k -> k-1), not a
+		 * legacy bare-add add-parity */
+		if (s->raiddisks > 0 && s->raiddisks < array.raid_disks)
+			return raidkm_shrink_data(devname, fd, c, s, &array);
 		if (s->raidkm_grow == RAIDKM_GROW_DATA)
 			return raidkm_grow_data(devname, fd, devlist, c, s, &array);
 		return raidkm_grow_parity(devname, fd, devlist, c, s, &array);
