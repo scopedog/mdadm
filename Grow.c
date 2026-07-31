@@ -2877,7 +2877,11 @@ static int raidkm_grow_parity_online(char *devname, int fd,
 		return 1;
 	}
 
-	new_layout = new_m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0);
+	/* only the m field moves — preserve every other layout bit (the old
+	 * `new_m | rotating` construction silently DROPPED the csum bit,
+	 * disabling checksumming when finish_reshape persisted the word;
+	 * the kernel now rejects non-m bit flips outright) */
+	new_layout = (array->layout & ~RAIDKM_LAYOUT_M_MASK) | new_m;
 
 	if (c->verbose >= 0)
 		pr_err("raidkm grow: %s add-parity m=%d->%d (raid-devices %d->%d, %s) via online COW reshape\n",
@@ -3042,6 +3046,115 @@ static int raidkm_shrink_data(char *devname, int fd, struct context *c,
 	rv = 0;
 	goto out;
 
+out_unfreeze:
+	if (froze > 0)
+		sysfs_set_str(sra, NULL, "sync_action", "idle");
+out:
+	if (sra)
+		sysfs_free(sra);
+	return rv;
+}
+
+/*
+ * raidkm_remove_parity() - drop ONE parity disk (m -> m-1, k and capacity
+ * fixed) from a classic raidkm (level 71) array via the in-kernel online COW
+ * reshape.  k is unchanged, so every row maps to itself and the walk is a
+ * pure per-row re-encode at the new rotation — the delta_disks = -1 staging
+ * rides the backward COW driver (see md-kmec remove-parity-design.md).  No
+ * --array-size dance: capacity is untouched.  On completion the freed slot's
+ * member becomes a spare — remove + --zero-superblock before reuse.
+ * Uniform for BOTH layouts (rotating and PARITY_N).
+ */
+static int raidkm_remove_parity(char *devname, int fd, struct context *c,
+				struct shape *s, struct mdu_array_info_s *array)
+{
+	struct mdinfo *sra = NULL;
+	int old_n = array->raid_disks;
+	int old_m = RAIDKM_LAYOUT_M(array->layout);
+	int new_m = old_m - 1, new_n = old_n - 1, new_layout;
+	int froze = 0, rv = 1;
+
+	if (array->layout & RAIDKM_LAYOUT_DCL) {
+		pr_err("raidkm grow: declustered remove-parity is not supported (classic layouts only)\n");
+		return 1;
+	}
+	if (s->parity_count != UnSet && s->parity_count != new_m) {
+		pr_err("raidkm grow: --remove-parity drops exactly one parity (m=%d->%d); --parity-count=%d conflicts\n",
+		       old_m, new_m, s->parity_count);
+		return 1;
+	}
+	if (new_m < 2) {
+		pr_err("raidkm grow: remove-parity needs at least 2 remaining parities (m=%d)\n",
+		       old_m);
+		return 1;
+	}
+	if (s->raiddisks > 0 && s->raiddisks != new_n) {
+		pr_err("raidkm grow: remove-parity to m=%d implies --raid-devices=%d (got %d)\n",
+		       new_m, new_n, s->raiddisks);
+		return 1;
+	}
+	if (array->active_disks < old_n || array->failed_disks) {
+		pr_err("raidkm grow: array is degraded (%d of %d present); heal it before removing parity\n",
+		       array->active_disks, old_n);
+		return 1;
+	}
+
+	/* only the m field moves; every other bit (rotation kind, csum) is
+	 * preserved — the kernel rejects non-m bit flips */
+	new_layout = (array->layout & ~RAIDKM_LAYOUT_M_MASK) | new_m;
+
+	if (c->verbose >= 0)
+		pr_err("raidkm grow: %s remove-parity m=%d->%d (raid-devices %d->%d, %s) via online COW reshape\n",
+		       devname, old_m, new_m, old_n, new_n,
+		       (array->layout & RAIDKM_LAYOUT_ROTATING) ? "rotating"
+								: "parity-N");
+
+	sra = sysfs_read(fd, NULL, GET_VERSION | GET_LEVEL | GET_DISKS);
+	if (!sra) {
+		pr_err("raidkm grow: cannot read sysfs state for %s\n", devname);
+		return 1;
+	}
+	froze = sysfs_freeze_array(sra);
+	if (froze < 0) {
+		pr_err("raidkm grow: %s is busy (resync/reshape in progress); retry when idle\n",
+		       devname);
+		goto out;
+	}
+
+	/* 1. stage the new layout (m-1); the kernel defers the real setup
+	 *    until raid_disks moves. */
+	if (sysfs_set_num(sra, NULL, "layout", new_layout) != 0) {
+		pr_err("raidkm grow: failed to stage new layout (m=%d) on %s\n",
+		       new_m, devname);
+		goto out_unfreeze;
+	}
+
+	/* 2. drop raid_disks -> update_raid_disks stages delta_disks = -1
+	 *    (and reshape_backwards; harmless for the in-place walk) and
+	 *    runs the kernel's check_reshape validation. */
+	if (sysfs_set_num(sra, NULL, "raid_disks", new_n) != 0) {
+		pr_err("raidkm grow: failed to set raid_disks=%d; reshape NOT started\n",
+		       new_n);
+		goto out_revert;
+	}
+
+	/* 3. start it (clears the freeze).  No backup file: the COW journal
+	 *    makes a crash recoverable on assembly. */
+	if (sysfs_set_str(sra, NULL, "sync_action", "reshape") < 0) {
+		pr_err("raidkm grow: failed to start the reshape on %s\n", devname);
+		goto out_revert;
+	}
+
+	if (c->verbose >= 0) {
+		pr_err("raidkm grow: remove-parity reshape started on %s; monitor /proc/mdstat or --detail\n",
+		       devname);
+		pr_err("raidkm grow: when it completes, the freed member becomes a spare — remove it with --remove and clear it with --zero-superblock before reuse\n");
+	}
+	rv = 0;
+	goto out;
+
+out_revert:
+	sysfs_set_num(sra, NULL, "layout", array->layout);
 out_unfreeze:
 	if (froze > 0)
 		sysfs_set_str(sra, NULL, "sync_action", "idle");
@@ -3697,6 +3810,10 @@ int Grow_reshape(char *devname, int fd,
 	     s->raiddisks ||
 	     ((array.layout & RAIDKM_LAYOUT_DCL) &&
 	      s->dcl_spare_cols != UnSet))) {
+		/* remove-parity first: it carries its own clear declustered
+		 * rejection (classic only) */
+		if (s->raidkm_grow == RAIDKM_GROW_REMOVE_PARITY)
+			return raidkm_remove_parity(devname, fd, c, s, &array);
 		/* declustered: widening the pool (--raid-devices=N') is a
 		 * distinct reshape from classic add-data/add-parity */
 		if (array.layout & RAIDKM_LAYOUT_DCL)

@@ -175,6 +175,7 @@ struct option long_options[] = {
 	{"add-journal", 0, 0, AddJournal},
 	{"add-parity", 0, 0, AddParity},
 	{"add-data", 0, 0, AddData},
+	{"remove-parity", 0, 0, RemoveParity},
 	{"remove", 0, 0, Remove},
 	{"fail", 0, 0, Fail},
 	{"set-faulty", 0, 0, Fail},
@@ -551,6 +552,8 @@ char Help_grow[] =
 "  --consistency-policy= : Change the consistency policy of an active array.\n"
 "                     -k : Currently works only for PPL with RAID5.\n"
 "  --add-parity          : raidkm: add one parity disk (m -> m+1); declustered:\n"
+"  --remove-parity       : raidkm: drop one parity disk (m -> m-1, online COW\n"
+"                          reshape; classic layouts only)\n"
 "                        : one new parity column per group (adds ngroups disks,\n"
 "                        : offline-only)\n"
 "  --add-data            : raidkm: add data disk(s); declustered: one new data\n"

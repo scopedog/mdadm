@@ -1102,6 +1102,14 @@ int main(int argc, char *argv[])
 							 : RAIDKM_GROW_PARITY;
 			devmode = 'a';
 			continue;
+		case O(GROW,RemoveParity): /* raidkm: drop one parity (m -> m-1) */
+			if (s.raidkm_grow &&
+			    s.raidkm_grow != RAIDKM_GROW_REMOVE_PARITY) {
+				pr_err("--remove-parity is mutually exclusive with --add-parity/--add-data\n");
+				exit(2);
+			}
+			s.raidkm_grow = RAIDKM_GROW_REMOVE_PARITY;
+			continue;
 		case O(MANAGE,AddSpare): /* add drive - never re-add */
 			devmode = 'S';
 			continue;
