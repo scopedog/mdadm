@@ -3350,8 +3350,14 @@ out:
  *     column per group), capacity unchanged.
  *   --add-data:    g -> g+1, k -> k+1; adds ngroups disks (one new data
  *     column per group), capacity grows.
- *   --spare-columns=s':  s -> s' (decrease only); N/g/m fixed, no disks added
- *     (delta_disks == 0), ngroups and capacity grow.
+ *   --spare-columns=s':  s -> s'; N/g/m fixed, no disks added
+ *     (delta_disks == 0).  A decrease grows ngroups and capacity (forward);
+ *     an INCREASE shrinks them — a BACKWARD walk, gated array-size-first.
+ *   pool shrink (--raid-devices=N-g):  remove one group's worth of disks;
+ *     g/m/s and the layout word fixed, ngroups and capacity drop.  BACKWARD
+ *     walk, gated array-size-first; the departing members (slots >= N-g)
+ *     become spares at completion — remove + --zero-superblock them before
+ *     reuse (they hold a readable pre-shrink copy; never auto-zeroed).
  *
  * mdadm runs the acceptance search for the NEW geometry's permutation seed,
  * adds any new pool disks as spares, and starts the in-kernel COW reshape
@@ -3419,9 +3425,20 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 			       devname, sc);
 			return 1;
 		}
-		if (new_sc > sc) {
-			pr_err("raidkm grow: raising the spare-column count (%u -> %u) shrinks capacity; capacity-shrinking reshapes are not supported\n",
-			       sc, new_sc);
+		/* an increase shrinks capacity: BACKWARD walk, gated
+		 * array-size-first below */
+	} else if (s->raiddisks > 0 && s->raiddisks < old_n) {
+		/* pool shrink: one group's worth of disks removed, layout
+		 * word fixed (BACKWARD walk, array-size-first below) */
+		kindname = "pool shrink";
+		new_n = s->raiddisks;
+		if (n_added) {
+			pr_err("raidkm grow: a declustered pool shrink removes disks; do not supply devices\n");
+			return 1;
+		}
+		if (new_n != old_n - (int)g) {
+			pr_err("raidkm grow: declustered pool shrink removes exactly one group's worth of disks per reshape (N=%d -> %d, g=%u); got --raid-devices=%d — repeat for a larger reduction\n",
+			       old_n, old_n - (int)g, g, new_n);
 			return 1;
 		}
 	} else {
@@ -3444,15 +3461,17 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 			   (new_g << 16) | (new_sc << 24));
 	layout_change = new_layout != array->layout;
 
-	if (n_added > 0 && n_added != new_n - old_n) {
-		pr_err("raidkm grow: declustered %s needs exactly %d new device(s), got %d\n",
-		       kindname, new_n - old_n, n_added);
-		return 1;
-	}
-	if (n_added == 0 && array->spare_disks < new_n - old_n) {
-		pr_err("raidkm grow: supply %d new pool disk(s) on the command line, or --add them as spares first\n",
-		       new_n - old_n);
-		return 1;
+	if (new_n > old_n) {
+		if (n_added > 0 && n_added != new_n - old_n) {
+			pr_err("raidkm grow: declustered %s needs exactly %d new device(s), got %d\n",
+			       kindname, new_n - old_n, n_added);
+			return 1;
+		}
+		if (n_added == 0 && array->spare_disks < new_n - old_n) {
+			pr_err("raidkm grow: supply %d new pool disk(s) on the command line, or --add them as spares first\n",
+			       new_n - old_n);
+			return 1;
+		}
 	}
 	if (array->active_disks < old_n) {
 		pr_err("raidkm grow: array is degraded (%d of %d present); rebuild before growing\n",
@@ -3469,10 +3488,39 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 	 * (load_super1 -> load_rkdcl1 populates st->rkdcl_nbase) */
 	st = super_by_fd(fd, &subarray);
 	sra = sysfs_read(fd, NULL, GET_VERSION | GET_LEVEL | GET_DISKS |
-				   GET_DEVS | GET_STATE);
+				   GET_DEVS | GET_STATE | GET_COMPONENT);
 	if (!st || !sra) {
 		pr_err("raidkm grow: cannot read metadata/sysfs for %s\n", devname);
 		goto out;
+	}
+
+	/* capacity-shrinking transitions (pool shrink, spare-count increase)
+	 * are gated ARRAY-SIZE-FIRST: the exposed size must already fit the
+	 * new geometry, or the backward walk would migrate over live tail
+	 * data.  The kernel enforces the same gate; this makes the failure
+	 * actionable (prints the exact --array-size clamp). */
+	if (ng_new * (new_g - new_m) < ng_old * (g - m)) {
+		unsigned long long rows, new_cap_kb, cur_bytes = 0;
+		unsigned int chunk_kb = array->chunk_size / 1024;
+
+		rows = sra->component_size / (array->chunk_size / 512);
+		new_cap_kb = rows * (unsigned long long)ng_new *
+			(new_g - new_m) * chunk_kb;
+		if (!get_dev_size(fd, NULL, &cur_bytes)) {
+			pr_err("raidkm grow: cannot read the current array size of %s\n",
+			       devname);
+			goto out;
+		}
+		if (cur_bytes / 1024 > new_cap_kb) {
+			pr_err("raidkm grow: %s exposes %llu KiB but the shrunk geometry holds only %llu KiB.\n",
+			       devname, cur_bytes / 1024, new_cap_kb);
+			pr_err("raidkm grow: shrink the filesystem to <= %llu KiB first, then run:\n",
+			       new_cap_kb);
+			pr_err("raidkm grow:     mdadm --grow %s --array-size=%llu\n",
+			       devname, new_cap_kb);
+			pr_err("raidkm grow: and retry (--array-size is an in-core clamp, reversible until the shrink runs)\n");
+			goto out;
+		}
 	}
 	for (sd = sra->devs; sd && !nbase; sd = sd->next) {
 		char *dp = map_dev(sd->disk.major, sd->disk.minor, 0);
@@ -3579,6 +3627,9 @@ static int raidkm_dcl_grow(char *devname, int fd, struct mddev_dev *devlist,
 	if (c->verbose >= 0) {
 		pr_err("raidkm grow: declustered %s started on %s; monitor /proc/mdstat or --detail\n",
 		       kindname, devname);
+		if (new_n < old_n)
+			pr_err("raidkm grow: when it completes, the %d departing members become spares — remove them with --remove and clear them with --zero-superblock before reuse (they hold a readable pre-shrink copy; a member failure before removal will pull them back in as rebuild targets)\n",
+			       old_n - new_n);
 		/* only add-data changes the k-cell row width the fs aligns to */
 		if (s->raidkm_grow == RAIDKM_GROW_DATA)
 			raidkm_fs_geometry_reminder(devname, new_g - new_m,
