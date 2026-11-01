@@ -561,6 +561,10 @@ static void examine_super1(struct supertype *st, char *homehost)
 			       (unsigned int)RAIDKM_LAYOUT_DCL_S(rkl));
 		if (rkl & RAIDKM_LAYOUT_CSUM)
 			printf("       Checksum : crc32c (native per-block)\n");
+		if (rkl & RAIDKM_LAYOUT_ROWMAP)
+			printf("        Row Map : on (unused rows are skipped)\n");
+		if (rkl & RAIDKM_LAYOUT_SNAP)
+			printf("      Snapshots : on (md/rk_snap; reserve rows past the array size)\n");
 	}
 	switch(__le32_to_cpu(sb->level)) {
 	case 0:
@@ -2043,6 +2047,115 @@ static int write_init_rkdcl(struct supertype *st, int fd)
 	return ret;
 }
 
+/* raidkm --row-map: zero the row state map so the kernel starts from all
+ * rows unwritten.  A disk with an old array's data there would otherwise
+ * read back as damaged map pages, which the kernel can only treat as
+ * "every row needs a sync".  Same placement and size as the kernel
+ * (km/raid_km-rowmap.c raidkm_rowmap_init): data_offset + the
+ * chunk-rounded component size, one 4 KiB page per
+ * RAIDKM_ROWMAP_ROWS_PER_PAGE rows.  Also run for a disk --add'ed later. */
+static int write_init_rkrm(struct supertype *st, int fd)
+{
+	struct mdp_superblock_1 *sb = st->sb;
+	unsigned long long off = rkdcl_blk_off1(sb);
+	unsigned long long comp = __le64_to_cpu(sb->size);
+	unsigned int chunk = __le32_to_cpu(sb->chunksize);
+	unsigned long long rows, pages, i;
+	void *buf;
+	int ret = 0;
+
+	if (!chunk)
+		return 1;
+	rows = comp / chunk;
+	pages = (rows + RAIDKM_ROWMAP_ROWS_PER_PAGE - 1) /
+		RAIDKM_ROWMAP_ROWS_PER_PAGE;
+	if (posix_memalign(&buf, 4096, 65536) != 0)
+		return 1;
+	memset(buf, 0, 65536);
+	for (i = 0; i < pages && !ret; i += 16) {
+		size_t n = (pages - i >= 16 ? 16 : pages - i) * 4096;
+
+		if (pwrite(fd, buf, n, off + i * 4096) != (ssize_t)n) {
+			pr_err("failed to zero the row map\n");
+			ret = 1;
+		}
+	}
+	free(buf);
+	return ret;
+}
+
+/* raidkm --snapshots: the snapshot metadata region, right after the row
+ * map (km/raid_km-snapmeta.c): zero its header, table, pmap and journal
+ * pages (the rmap slots are only read where the pmap says a page was
+ * written, so they need nothing), and at create write the init header:
+ * R = 0 and the reserve percentage, sealed as the kernel seals it
+ * (crc32c over body + id + gen, xor the page kind's magic; id = crc32c of
+ * the array uuid, as the row map's).  The kernel sizes the origin from it
+ * at the first assemble.  An --add only zeroes: the kernel writes the whole
+ * region to a member before it is rebuilt. */
+static int write_init_rksn(struct supertype *st, int fd)
+{
+	struct mdp_superblock_1 *sb = st->sb;
+	unsigned long long comp = __le64_to_cpu(sb->size);
+	unsigned int chunk = __le32_to_cpu(sb->chunksize);
+	unsigned long long rows, off, pages, jrnl, i, n;
+	unsigned char *buf;
+	__u32 id, crc;
+	int ret = 0, r;
+
+	if (!chunk)
+		return 1;
+	rows = comp / chunk;
+	off = rkdcl_blk_off1(sb) +
+	      (rows + RAIDKM_ROWMAP_ROWS_PER_PAGE - 1) /
+	      RAIDKM_ROWMAP_ROWS_PER_PAGE * 4096;
+	pages = rksn_region_pages(rows);
+	jrnl = RKSN_OFF_PMAP + 2 * rksn_pmap_pages(rows) +
+	       2 * rksn_rmap_pages(rows);
+	if (posix_memalign((void **)&buf, 4096, 65536) != 0)
+		return 1;
+	memset(buf, 0, 65536);
+	/* header, table and pmap copies; then the journal */
+	for (r = 0; r < 2 && !ret; r++) {
+		unsigned long long from = r ? jrnl : 0;
+		unsigned long long to = r ? pages :
+			RKSN_OFF_PMAP + 2 * rksn_pmap_pages(rows);
+
+		for (i = from; i < to && !ret; i += n) {
+			n = to - i < 16 ? to - i : 16;
+			if (pwrite(fd, buf, n * 4096, off + i * 4096) !=
+			    (ssize_t)(n * 4096)) {
+				pr_err("failed to zero the snapshot metadata\n");
+				ret = 1;
+			}
+		}
+	}
+	if (!ret && st->raidkm_snap_pct) {
+		struct rksn_hdr *h = (struct rksn_hdr *)buf;
+
+		memset(buf, 0, 4096);
+		h->magic = __cpu_to_le32(RKSN_MAGIC_HDR);
+		h->version = __cpu_to_le32(RKSN_VERSION);
+		h->reserve_pct = __cpu_to_le32(st->raidkm_snap_pct);
+		h->jpages = __cpu_to_le32(RKSN_JPAGES);
+		/* R, O, rs, ckpt, jtail, rmap_pages = 0 */
+		h->next_id = __cpu_to_le32(1);
+		h->slots = __cpu_to_le32(RKSN_SLOTS);
+		id = crc32c_le(0, (unsigned char *)sb->set_uuid,
+			       sizeof(sb->set_uuid));
+		*(__u32 *)(buf + RKSN_BODY) = __cpu_to_le32(id);
+		/* gen (buf + RKSN_BODY + 4) = 0 */
+		crc = crc32c_le(0, buf, RKSN_BODY + 12) ^ RKSN_MAGIC_HDR;
+		*(__u32 *)(buf + RKSN_BODY + 12) = __cpu_to_le32(crc);
+		if (pwrite(fd, buf, 4096, off) != 4096) {
+			pr_err("failed to write the snapshot header\n");
+			ret = 1;
+		}
+	}
+	free(buf);
+	return ret;
+}
+
 /* raidkm declustered: recover the permutation seed + nbase into st->rkdcl_*
  * from a member's on-disk rkdcl block, so metadata writers OUTSIDE create —
  * --add of a replacement disk clones a live member's metadata via
@@ -2092,6 +2205,10 @@ static int write_init_super1(struct supertype *st)
 	unsigned long long data_offset;
 	long bm_offset;
 	bool raid0_need_layout = false;
+	/* raidkm row map / snapshots: the component size the first member's
+	 * tail reserve settled on; every member must use the same one (the
+	 * kernel finds the reserves at data_offset + size) */
+	unsigned long long rk_tail_size = 0;
 
 	/* Since linux kernel v5.4, raid0 always has a layout */
 	if (has_raid0_layout(sb) && get_linux_version() >= 5004000)
@@ -2115,6 +2232,18 @@ static int write_init_super1(struct supertype *st)
 			if (s1 != s2)
 				raid0_need_layout = true;
 		}
+	}
+
+	/* raidkm --row-map: the map lives right after the data area, where
+	 * metadata 1.0 keeps its superblock, bitmap and bad-block log (and
+	 * the kernel refuses it there).  Refuse before any disk is written. */
+	if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+	    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_ROWMAP) &&
+	    st->minor_version == 0) {
+		pr_err("%s needs metadata 1.1 or 1.2 (1.0 keeps its superblock where the map goes)\n",
+		       (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_SNAP) ?
+		       "--snapshots (it needs the row map)" : "--row-map");
+		return 1;
 	}
 
 	for (di = st->info; di; di = di->next) {
@@ -2252,6 +2381,75 @@ static int write_init_super1(struct supertype *st)
 						sb->size = __cpu_to_le64(usable);
 				}
 			}
+			/* raidkm --row-map: reserve the row state map at the
+			 * tail, a 2-bit state per row (one chunk of every
+			 * member), RAIDKM_ROWMAP_ROWS_PER_PAGE per 4 KiB page.
+			 * The kernel puts it at data_offset + dev_sectors and
+			 * sizes it from dev_sectors <= data_size, so sizing
+			 * it here from data_size always leaves enough room.
+			 * Not with --checksum or declustered (Create.c). */
+			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+			    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_ROWMAP)) {
+				unsigned long long usable =
+					__le64_to_cpu(sb->data_size);
+				unsigned long long chunk =
+					__le32_to_cpu(sb->chunksize);
+				unsigned long long rows, region;
+
+				if (chunk < 8)
+					chunk = 8;
+				rows = usable / chunk;
+				region = (rows + RAIDKM_ROWMAP_ROWS_PER_PAGE - 1) /
+					 RAIDKM_ROWMAP_ROWS_PER_PAGE * 8;
+				if (usable > region + chunk) {
+					usable -= region;
+					usable -= usable % chunk;
+					sb->data_size = __cpu_to_le64(usable);
+					if (__le64_to_cpu(sb->size) > usable)
+						sb->size = __cpu_to_le64(usable);
+				}
+			}
+			/* raidkm --snapshots: the snapshot metadata right
+			 * after the row map; sized from data_size (>= the
+			 * kernel's dev_sectors), so it always fits */
+			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+			    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_SNAP)) {
+				unsigned long long usable =
+					__le64_to_cpu(sb->data_size);
+				unsigned long long chunk =
+					__le32_to_cpu(sb->chunksize);
+				unsigned long long region;
+
+				if (chunk < 8)
+					chunk = 8;
+				region = rksn_region_pages(usable / chunk) * 8;
+				if (usable <= region + chunk) {
+					pr_err("%s has no room for the snapshot metadata (%llu KiB)\n",
+					       di->devname, region / 2);
+					rv = 1;
+					goto error_out;
+				}
+				usable -= region;
+				usable -= usable % chunk;
+				sb->data_size = __cpu_to_le64(usable);
+				if (__le64_to_cpu(sb->size) > usable)
+					sb->size = __cpu_to_le64(usable);
+			}
+			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+			    (__le32_to_cpu(sb->layout) &
+			     (RAIDKM_LAYOUT_ROWMAP | RAIDKM_LAYOUT_SNAP))) {
+				/* a later member whose reserve shrank the size:
+				 * the ones written before sit at another offset */
+				if (rk_tail_size &&
+				    __le64_to_cpu(sb->size) != rk_tail_size) {
+					pr_err("%s is smaller than the members before it: no room for the row map / snapshot metadata at their size; give --size=%lluK or smaller\n",
+					       di->devname,
+					       (unsigned long long)__le64_to_cpu(sb->size) / 2);
+					rv = 1;
+					goto error_out;
+				}
+				rk_tail_size = __le64_to_cpu(sb->size);
+			}
 			/* raidkm declustered: reserve one chunk at the tail
 			 * for the rkdcl metadata block (permutation seed +
 			 * nbase + the spare-assignment table/journal).
@@ -2347,6 +2545,16 @@ static int write_init_super1(struct supertype *st)
 		    __le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
 		    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL))
 			rv = write_init_rkdcl(st, di->fd);
+
+		if (rv == 0 &&
+		    __le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+		    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_ROWMAP))
+			rv = write_init_rkrm(st, di->fd);
+
+		if (rv == 0 &&
+		    __le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+		    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_SNAP))
+			rv = write_init_rksn(st, di->fd);
 
 		close(di->fd);
 		di->fd = -1;

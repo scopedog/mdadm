@@ -566,6 +566,10 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 		pr_err("no more than 256 raid-devices supported for level 6\n");
 		return 1;
 	}
+	if (s->raidkm_snap_pct > 0 && s->level != LEVEL_RAIDKM) {
+		pr_err("--snapshots is for --level=raidkm only\n");
+		return 1;
+	}
 	if (s->level == LEVEL_RAIDKM) {
 		/* Compose the packed layout the kernel/superblock expect from the
 		 * separately-specified count and placement.  Defaults: m=2 parity
@@ -627,9 +631,31 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 			s->layout = m | RAIDKM_LAYOUT_DCL |
 				    (g << 16) | (sc << 24) |
 				    (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
+			if (s->raidkm_rowmap == 1 || s->raidkm_snap_pct > 0) {
+				pr_err("--row-map and --snapshots are not supported with declustered parity\n");
+				return 1;
+			}
 		} else {
+			/* snapshots take their free rows from the row map */
+			if (s->raidkm_snap_pct > 0)
+				s->raidkm_rowmap = 1;
 			s->layout = m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0)
-				      | (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
+				      | (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0)
+				      | (s->raidkm_rowmap == 1 ? RAIDKM_LAYOUT_ROWMAP : 0)
+				      | (s->raidkm_snap_pct > 0 ? RAIDKM_LAYOUT_SNAP : 0);
+			if (s->raidkm_rowmap == 1 && s->raidkm_csum == 1) {
+				pr_err("%s is not supported with --checksum yet\n",
+				       s->raidkm_snap_pct > 0 ? "--snapshots" : "--row-map");
+				return 1;
+			}
+			/* a new row map says every row is unused: over members
+			 * that already hold data (what --assume-clean is for) a
+			 * rebuild would then skip that data */
+			if (s->raidkm_rowmap == 1 && s->assume_clean) {
+				pr_err("%s cannot be used with --assume-clean: the new row map marks every row unused, so a rebuild would skip data already on the members (the row map needs no initial sync anyway)\n",
+				       s->raidkm_snap_pct > 0 ? "--snapshots (it needs the row map)" : "--row-map");
+				return 1;
+			}
 			if (s->raiddisks <= m) {
 				pr_err("raidkm needs at least %d raid-devices for m=%d (one or more data disks plus %d parity)\n",
 				       m + 1, m, m);
@@ -1227,6 +1253,9 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 	/* raidkm declustered: hand the accepted permutation seed to super1
 	 * (written into the on-disk rkdcl metadata block per member) */
 	st->rkdcl_seed = (s->raidkm_declustered == 1) ? s->dcl_seed : 0;
+	/* raidkm --snapshots: the members get the init header (an --add later
+	 * only zeroes the region; the kernel writes it there) */
+	st->raidkm_snap_pct = s->raidkm_snap_pct > 0 ? s->raidkm_snap_pct : 0;
 	st->rkdcl_nbase = (s->raidkm_declustered == 1) ?
 			  (unsigned int)s->dcl_nbase : 0;
 	if (!st->ss->init_super(st, &info.array, s, name, c->homehost, uuid,

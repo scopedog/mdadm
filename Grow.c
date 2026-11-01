@@ -3810,6 +3810,17 @@ int Grow_reshape(char *devname, int fd,
 	     s->raiddisks ||
 	     ((array.layout & RAIDKM_LAYOUT_DCL) &&
 	      s->dcl_spare_cols != UnSet))) {
+		/* row map / snapshots: the kernel refuses an online reshape,
+		 * and the stop-and-recreate paths (add-parity on parity-last,
+		 * shrink) would build a layout without these bits -- an array
+		 * with snapshots would then show its physical rows as the
+		 * origin (redirected rows, the snapshots: gone).  Refused. */
+		if (array.layout & (RAIDKM_LAYOUT_ROWMAP | RAIDKM_LAYOUT_SNAP)) {
+			pr_err("%s: reshaping a raidkm array with %s is not supported\n",
+			       devname, (array.layout & RAIDKM_LAYOUT_SNAP) ?
+			       "snapshots" : "a row map");
+			return 1;
+		}
 		/* remove-parity first: it carries its own clear declustered
 		 * rejection (classic only) */
 		if (s->raidkm_grow == RAIDKM_GROW_REMOVE_PARITY)

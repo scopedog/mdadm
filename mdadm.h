@@ -524,6 +524,9 @@ enum special_options {
 	Layout,
 	ParityCount,	/* raidkm: number of parity disks (m); replaces packing m into --layout */
 	Integrity,	/* raidkm: native per-block checksum (--checksum / --integrity) */
+	RowMap,		/* raidkm: row state map (--row-map) */
+	Snapshots,	/* raidkm: native snapshots (--snapshots=<reserve %>) */
+	SnapshotCmd,	/* raidkm: "--snapshot" not as the first argument */
 	GroupWidth,	/* raidkm declustered: group width g = k + m */
 	SpareColumns,	/* raidkm declustered: spare columns per row */
 	DclNbase,	/* raidkm declustered: base permutations (default 16) */
@@ -713,6 +716,8 @@ struct shape {
 	int	parity_count;		/* m (parity disks); UnSet = default RAIDKM_MIN_M */
 	int	raidkm_rotating;	/* UnSet = default rotating; 0 = parity-last; 1 = rotating */
 	int	raidkm_csum;		/* UnSet/0 = off; 1 = native CRC-32C (--checksum) */
+	int	raidkm_rowmap;		/* UnSet/0 = off; 1 = row state map (--row-map) */
+	int	raidkm_snap_pct;	/* 0 = off; 1..90 = snapshots, reserve % */
 	int	raidkm_declustered;	/* UnSet/0 = off; 1 = --layout=declustered */
 	int	dcl_group_width;	/* g = k + m; required when declustered */
 	int	dcl_spare_cols;		/* s; UnSet = auto (N mod g, or g) */
@@ -1415,6 +1420,8 @@ struct supertype {
 	unsigned long long devsize;
 	unsigned long long data_offset; /* used by v1.x only */
 	unsigned long long rkdcl_seed;	/* raidkm declustered: create-time seed */
+	unsigned int raidkm_snap_pct;	/* raidkm --snapshots, create only: write
+					 * the init header (an --add zeroes) */
 	unsigned int rkdcl_nbase;	/* raidkm declustered: base permutations */
 	void *rkdcl_blk;		/* raidkm declustered: verbatim rkdcl
 					 * block read off the loaded member —
@@ -1586,6 +1593,7 @@ struct stat64;
 extern int add_dev(const char *name, const struct stat *stb, int flag, struct FTW *s);
 
 extern int Manage_ro(char *devname, int fd, int readonly);
+extern int Snapshot(int argc, char *argv[]);	/* raidkm: mdadm --snapshot */
 extern int Manage_run(char *devname, int fd, struct context *c);
 extern int Manage_stop(char *devname, int fd, int quiet,
 		       int will_retry);
@@ -2012,6 +2020,59 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
 #define	RAIDKM_LAYOUT_M_MASK	(0x00ff)
 #define	RAIDKM_LAYOUT_ROTATING	(0x0100)
 #define	RAIDKM_LAYOUT_CSUM	(0x0200)	/* native per-block CRC-32C (--checksum) */
+/* Row state map (bit 11, --row-map): a 2-bit state per row (one chunk of
+ * every member) in a tail reserve, so rebuild/resync/check skip rows that
+ * hold no data.  4 KiB pages of RAIDKM_ROWMAP_ROWS_PER_PAGE states each
+ * (km/raid_km_rowmap.h RK_RM_ROWS_PER_PAGE); the kernel finds it at
+ * data_offset + dev_sectors. */
+#define	RAIDKM_LAYOUT_ROWMAP	(0x0800)
+#define	RAIDKM_ROWMAP_ROWS_PER_PAGE	((4096 - 16) * 4)
+/* Native snapshots (bit 12, --snapshots=<reserve %>, implies --row-map): a
+ * second tail reserve right after the row map holds the snapshot metadata
+ * (km/raid_km_snap.h): header x2, table x2, pmap x2, two rmap slots and a
+ * journal ring, in 4 KiB pages.  The array exports (100 - reserve)% of its
+ * rows; the rest takes the rows snapshots keep.  mdadm zeroes the region and,
+ * at create, writes a header with R = 0 that the kernel completes. */
+#define	RAIDKM_LAYOUT_SNAP	(0x1000)
+#define	RKSN_BODY		(4096 - 16)
+#define	RKSN_MAGIC_HDR		0x524b5348U	/* "RKSH" */
+#define	RKSN_VERSION		1
+#define	RKSN_SLOTS		64
+#define	RKSN_TBL_PAGES		22		/* 64 slots, 3 per page */
+#define	RKSN_RMAP_PER_PAGE	(RKSN_BODY / 8)
+#define	RKSN_PMAP_PER_PAGE	RKSN_BODY
+#define	RKSN_JPAGES		1024
+#define	RKSN_OFF_PMAP		(2 + 2 * RKSN_TBL_PAGES)
+/* the header page's body, as km/raid_km_snap.h struct rk_sn_hdr */
+struct rksn_hdr {
+	__u32	magic;
+	__u32	version;
+	__u32	reserve_pct;
+	__u32	jpages;
+	__u64	R;		/* 0: init header, the kernel completes it */
+	__u64	O;
+	__u64	rs;
+	__u64	ckpt;
+	__u64	jtail;
+	__u32	next_id;
+	__u32	slots;
+	__u64	rmap_pages;
+} __attribute__((packed));
+static inline unsigned long long rksn_rmap_pages(unsigned long long rows)
+{
+	return (rows + RKSN_RMAP_PER_PAGE - 1) / RKSN_RMAP_PER_PAGE;
+}
+static inline unsigned long long rksn_pmap_pages(unsigned long long rows)
+{
+	return (rksn_rmap_pages(rows) + RKSN_PMAP_PER_PAGE - 1) /
+		RKSN_PMAP_PER_PAGE;
+}
+/* the region's size in 4 KiB pages, as the kernel's rk_sn_region_pages() */
+static inline unsigned long long rksn_region_pages(unsigned long long rows)
+{
+	return RKSN_OFF_PMAP + 2 * rksn_pmap_pages(rows) +
+		2 * rksn_rmap_pages(rows) + RKSN_JPAGES;
+}
 /* Declustered parity (bit 10): stripes of width g = k+m scattered over the
  * N-disk pool with distributed spare columns; g in bits 16-23, spare-column
  * count in bits 24-30 (s <= 127 keeps the int layout word positive).  nbase

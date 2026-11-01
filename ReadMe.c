@@ -132,6 +132,11 @@ struct option long_options[] = {
 	{"parities", 1, 0, ParityCount},     /* raidkm: alias for --parity-count */
 	{"checksum", 2, 0, Integrity},       /* raidkm: native per-block checksum; bare = crc32c */
 	{"integrity", 1, 0, Integrity},      /* raidkm: alias of --checksum (per-block CRC-32C) */
+	{"row-map", 0, 0, RowMap},           /* raidkm: row state map (skip unused rows) */
+	{"snapshots", 1, 0, Snapshots},      /* raidkm: native snapshots, reserve % */
+	/* exact, so getopt does not take it as an abbreviation of --snapshots;
+	 * "mdadm --snapshot <array> ..." is caught before getopt (mdadm.c) */
+	{"snapshot", 2, 0, SnapshotCmd},
 	{"group-width", 1, 0, GroupWidth},   /* raidkm declustered: g = k + m */
 	{"spare-columns", 1, 0, SpareColumns}, /* raidkm declustered: spares/row */
 	{"dcl-nbase", 1, 0, DclNbase},       /* raidkm declustered: base perms */

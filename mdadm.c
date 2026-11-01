@@ -100,6 +100,16 @@ int main(int argc, char *argv[])
 	char *configfile = NULL;
 	int devmode = 0;
 	struct mddev_dev *devlist = NULL;
+
+	/* raidkm: "mdadm --snapshot /dev/mdX --create ..." -- its own small
+	 * command line (its --create/--destroy are not mdadm's modes); also
+	 * after options like -v */
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--snapshot"))
+			return Snapshot(argc - i - 1, argv + i + 1);
+		if (argv[i][0] != '-' || !strcmp(argv[i], "--"))
+			break;
+	}
 	struct mddev_dev **devlistend = & devlist;
 	struct mddev_dev *dv;
 	mdu_array_info_t array;
@@ -115,6 +125,8 @@ int main(int argc, char *argv[])
 		.parity_count	= UnSet,
 		.raidkm_rotating = UnSet,
 		.raidkm_csum	= UnSet,
+		.raidkm_rowmap	= UnSet,
+		.raidkm_snap_pct = 0,		/* off */
 		.raidkm_declustered = UnSet,
 		.dcl_group_width = UnSet,
 		.dcl_spare_cols	= UnSet,
@@ -165,6 +177,9 @@ int main(int argc, char *argv[])
 		int newmode = mode;
 		/* firstly, some mode-independent options */
 		switch(opt) {
+		case SnapshotCmd:	/* raidkm: --snapshot not first */
+			pr_err("--snapshot is its own command: mdadm --snapshot <array> --create|--destroy|--rename|--set|--list|--exists|--checkpoint ...  (for --create of a new array: --snapshots=<reserve %%>)\n");
+			exit(2);
 		case HelpOptions:
 			print_help = 2;
 			continue;
@@ -741,6 +756,19 @@ int main(int argc, char *argv[])
 				exit(2);
 			}
 			s.raidkm_csum = 1;
+			continue;
+
+		case O(CREATE,RowMap): /* raidkm: --row-map */
+			s.raidkm_rowmap = 1;
+			continue;
+
+		case O(CREATE,Snapshots): /* raidkm: --snapshots=<reserve %> */
+			if (parse_num(&s.raidkm_snap_pct, optarg) != 0 ||
+			    s.raidkm_snap_pct < 1 || s.raidkm_snap_pct > 90) {
+				pr_err("--snapshots needs the reserve in percent of the rows, 1-90 (e.g. --snapshots=20), not %s\n",
+				       optarg);
+				exit(2);
+			}
 			continue;
 
 		case O(CREATE,GroupWidth): /* raidkm declustered: g = k + m */
