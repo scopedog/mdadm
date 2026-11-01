@@ -1569,8 +1569,6 @@ try_again:
 				goto try_again;
 			goto out;
 		}
-		/* just incase it was started but has no content */
-		ioctl(mdfd, STOP_ARRAY, NULL);
 	}
 
 	if (content != &info) {
