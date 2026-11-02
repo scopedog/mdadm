@@ -2012,6 +2012,19 @@ static unsigned long long rkdcl_blk_off1(struct mdp_superblock_1 *sb)
 	return (__le64_to_cpu(sb->data_offset) + comp) << 9;
 }
 
+/* raidkm --row-map: byte offset of the row map, the start of the tail
+ * the row map and then the snapshot metadata take.  Right after the data
+ * (the component size, as rkdcl_blk_off1); on a declustered array one
+ * chunk later, past the rkdcl block's chunk (km raidkm_rowmap_init). */
+static unsigned long long rkrm_off1(struct mdp_superblock_1 *sb)
+{
+	unsigned long long off = rkdcl_blk_off1(sb);
+
+	if (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL)
+		off += (unsigned long long)__le32_to_cpu(sb->chunksize) << 9;
+	return off;
+}
+
 /* raidkm declustered: write the rkdcl metadata block (permutation seed +
  * nbase — what the packed layout word cannot carry) into the reserved
  * tail chunk past the component size.  One identical copy per member. */
@@ -2052,12 +2065,12 @@ static int write_init_rkdcl(struct supertype *st, int fd)
  * read back as damaged map pages, which the kernel can only treat as
  * "every row needs a sync".  Same placement and size as the kernel
  * (km/raid_km-rowmap.c raidkm_rowmap_init): data_offset + the
- * chunk-rounded component size, one 4 KiB page per
+ * chunk-rounded component size (+ one chunk, declustered), one 4 KiB page per
  * RAIDKM_ROWMAP_ROWS_PER_PAGE rows.  Also run for a disk --add'ed later. */
 static int write_init_rkrm(struct supertype *st, int fd)
 {
 	struct mdp_superblock_1 *sb = st->sb;
-	unsigned long long off = rkdcl_blk_off1(sb);
+	unsigned long long off = rkrm_off1(sb);
 	unsigned long long comp = __le64_to_cpu(sb->size);
 	unsigned int chunk = __le32_to_cpu(sb->chunksize);
 	unsigned long long rows, pages, i;
@@ -2106,7 +2119,7 @@ static int write_init_rksn(struct supertype *st, int fd)
 	if (!chunk)
 		return 1;
 	rows = comp / chunk;
-	off = rkdcl_blk_off1(sb) +
+	off = rkrm_off1(sb) +
 	      (rows + RAIDKM_ROWMAP_ROWS_PER_PAGE - 1) /
 	      RAIDKM_ROWMAP_ROWS_PER_PAGE * 4096;
 	pages = rksn_region_pages(rows);
@@ -2387,7 +2400,9 @@ static int write_init_super1(struct supertype *st)
 			 * The kernel puts it at data_offset + dev_sectors and
 			 * sizes it from dev_sectors <= data_size, so sizing
 			 * it here from data_size always leaves enough room.
-			 * Not with --checksum or declustered (Create.c). */
+			 * Not with --checksum (Create.c).  Declustered: the
+			 * kernel puts it one chunk later, after the rkdcl
+			 * block; the rkdcl reserve below adds that chunk. */
 			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
 			    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_ROWMAP)) {
 				unsigned long long usable =
@@ -2435,25 +2450,12 @@ static int write_init_super1(struct supertype *st)
 				if (__le64_to_cpu(sb->size) > usable)
 					sb->size = __cpu_to_le64(usable);
 			}
-			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
-			    (__le32_to_cpu(sb->layout) &
-			     (RAIDKM_LAYOUT_ROWMAP | RAIDKM_LAYOUT_SNAP))) {
-				/* a later member whose reserve shrank the size:
-				 * the ones written before sit at another offset */
-				if (rk_tail_size &&
-				    __le64_to_cpu(sb->size) != rk_tail_size) {
-					pr_err("%s is smaller than the members before it: no room for the row map / snapshot metadata at their size; give --size=%lluK or smaller\n",
-					       di->devname,
-					       (unsigned long long)__le64_to_cpu(sb->size) / 2);
-					rv = 1;
-					goto error_out;
-				}
-				rk_tail_size = __le64_to_cpu(sb->size);
-			}
 			/* raidkm declustered: reserve one chunk at the tail
 			 * for the rkdcl metadata block (permutation seed +
 			 * nbase + the spare-assignment table/journal).
-			 * The kernel finds it at data_offset + data_size.
+			 * The kernel finds it at data_offset + dev_sectors
+			 * (the chunk-rounded component size, rkdcl_blk_off1);
+			 * the row map and the snapshot metadata follow it.
 			 * With --checksum the two reserves STACK: the csum
 			 * clamp above ran first, so the tail ends up
 			 * [rkdcl chunk][CRC region] and the kernel derives
@@ -2486,6 +2488,23 @@ static int write_init_super1(struct supertype *st)
 					if (__le64_to_cpu(sb->size) > usable)
 						sb->size = __cpu_to_le64(usable);
 				}
+			}
+			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+			    (__le32_to_cpu(sb->layout) &
+			     (RAIDKM_LAYOUT_ROWMAP | RAIDKM_LAYOUT_SNAP))) {
+				/* a later member whose reserve shrank the size:
+				 * the ones written before sit at another offset.
+				 * After every clamp (the rkdcl one included):
+				 * the size the kernel will place the tail by */
+				if (rk_tail_size &&
+				    __le64_to_cpu(sb->size) != rk_tail_size) {
+					pr_err("%s is smaller than the members before it: no room for the row map / snapshot metadata at their size; give --size=%lluK or smaller\n",
+					       di->devname,
+					       (unsigned long long)__le64_to_cpu(sb->size) / 2);
+					rv = 1;
+					goto error_out;
+				}
+				rk_tail_size = __le64_to_cpu(sb->size);
 			}
 			if (data_offset >= sb_offset+bm_offset+bm_space+8) {
 				sb->bblog_size = __cpu_to_le16(8);

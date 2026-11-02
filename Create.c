@@ -627,40 +627,37 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 			 * the CRC-region reserve and the rkdcl chunk reserve
 			 * at the tail (csum clamp first, then the dcl chunk),
 			 * and the kernel finds the CRC region one chunk past
-			 * dev_sectors (after the rkdcl block). */
+			 * dev_sectors (after the rkdcl block); the row map
+			 * and the snapshot metadata go there the same way. */
 			s->layout = m | RAIDKM_LAYOUT_DCL |
 				    (g << 16) | (sc << 24) |
 				    (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
-			if (s->raidkm_rowmap == 1 || s->raidkm_snap_pct > 0) {
-				pr_err("--row-map and --snapshots are not supported with declustered parity\n");
-				return 1;
-			}
 		} else {
-			/* snapshots take their free rows from the row map */
-			if (s->raidkm_snap_pct > 0)
-				s->raidkm_rowmap = 1;
 			s->layout = m | (rotating ? RAIDKM_LAYOUT_ROTATING : 0)
-				      | (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0)
-				      | (s->raidkm_rowmap == 1 ? RAIDKM_LAYOUT_ROWMAP : 0)
-				      | (s->raidkm_snap_pct > 0 ? RAIDKM_LAYOUT_SNAP : 0);
-			if (s->raidkm_rowmap == 1 && s->raidkm_csum == 1) {
-				pr_err("%s is not supported with --checksum yet\n",
-				       s->raidkm_snap_pct > 0 ? "--snapshots" : "--row-map");
-				return 1;
-			}
-			/* a new row map says every row is unused: over members
-			 * that already hold data (what --assume-clean is for) a
-			 * rebuild would then skip that data */
-			if (s->raidkm_rowmap == 1 && s->assume_clean) {
-				pr_err("%s cannot be used with --assume-clean: the new row map marks every row unused, so a rebuild would skip data already on the members (the row map needs no initial sync anyway)\n",
-				       s->raidkm_snap_pct > 0 ? "--snapshots (it needs the row map)" : "--row-map");
-				return 1;
-			}
+				      | (s->raidkm_csum == 1 ? RAIDKM_LAYOUT_CSUM : 0);
 			if (s->raiddisks <= m) {
 				pr_err("raidkm needs at least %d raid-devices for m=%d (one or more data disks plus %d parity)\n",
 				       m + 1, m, m);
 				return 1;
 			}
+		}
+		/* snapshots take their free rows from the row map */
+		if (s->raidkm_snap_pct > 0)
+			s->raidkm_rowmap = 1;
+		s->layout |= (s->raidkm_rowmap == 1 ? RAIDKM_LAYOUT_ROWMAP : 0)
+			   | (s->raidkm_snap_pct > 0 ? RAIDKM_LAYOUT_SNAP : 0);
+		if (s->raidkm_rowmap == 1 && s->raidkm_csum == 1) {
+			pr_err("%s is not supported with --checksum yet\n",
+			       s->raidkm_snap_pct > 0 ? "--snapshots" : "--row-map");
+			return 1;
+		}
+		/* a new row map says every row is unused: over members
+		 * that already hold data (what --assume-clean is for) a
+		 * rebuild would then skip that data */
+		if (s->raidkm_rowmap == 1 && s->assume_clean) {
+			pr_err("%s cannot be used with --assume-clean: the new row map marks every row unused, so a rebuild would skip data already on the members (the row map needs no initial sync anyway)\n",
+			       s->raidkm_snap_pct > 0 ? "--snapshots (it needs the row map)" : "--row-map");
+			return 1;
 		}
 		if (s->raiddisks > RAIDKM_MAX_DISKS) {
 			pr_err("no more than %d raid-devices supported for raidkm\n",

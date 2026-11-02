@@ -2024,7 +2024,8 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
  * every member) in a tail reserve, so rebuild/resync/check skip rows that
  * hold no data.  4 KiB pages of RAIDKM_ROWMAP_ROWS_PER_PAGE states each
  * (km/raid_km_rowmap.h RK_RM_ROWS_PER_PAGE); the kernel finds it at
- * data_offset + dev_sectors. */
+ * data_offset + dev_sectors, one chunk later on a declustered array (the
+ * rkdcl block's chunk is there; super1.c rkrm_off1). */
 #define	RAIDKM_LAYOUT_ROWMAP	(0x0800)
 #define	RAIDKM_ROWMAP_ROWS_PER_PAGE	((4096 - 16) * 4)
 /* Native snapshots (bit 12, --snapshots=<reserve %>, implies --row-map): a
