@@ -19,7 +19,8 @@
  * looks for).
  *
  * Exit: 0 ok, 1 no such snapshot, 16 busy (mounted), 17 exists,
- * 22 bad argument, 5 anything else.
+ * 22 bad argument or an array without --snapshots (every op, --list and
+ * --exists too: how a caller checks support), 5 anything else.
  */
 #include "mdadm.h"
 #include <limits.h>
@@ -211,6 +212,20 @@ static void snap_usage(void)
 		"       mdadm --snapshot /dev/mdX --checkpoint\n");
 }
 
+/* md/rk_snap's first line is "off" on an array without snapshots */
+static int snap_enabled(void)
+{
+	char buf[16] = "";
+	FILE *f = fopen(snap_sys, "r");
+
+	if (!f)
+		return 0;
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = '\0';
+	fclose(f);
+	return strncmp(buf, "off", 3) != 0;
+}
+
 /* argv[0] = the array, argv[1] = the operation, then its arguments */
 int Snapshot(int argc, char *argv[])
 {
@@ -236,6 +251,14 @@ int Snapshot(int argc, char *argv[])
 	snprintf(snap_sys, sizeof(snap_sys), "/sys/block/%s/md/rk_snap", base);
 	if (access(snap_sys, R_OK)) {
 		pr_err("%s is not a raidkm array (no md/rk_snap)\n", argv[0]);
+		return 22;
+	}
+	/* every op, --list and --exists too, fails with 22 on an array made
+	 * without --snapshots (md/rk_snap reads "off"): callers such as
+	 * snapshot tools check support this way before they freeze anything */
+	if (!snap_enabled()) {
+		pr_err("%s has no native snapshots (not created with --snapshots)\n",
+		       argv[0]);
 		return 22;
 	}
 	op = argv[1];
