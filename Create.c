@@ -493,6 +493,27 @@ out:
 	return ret;
 }
 
+/* modprobe raidkm, without a shell (mdadm --create also runs from an
+ * initramfs): its output goes nowhere, its failure is the caller's to
+ * notice (the module is still not there) */
+static void rk_modprobe(void)
+{
+	pid_t pid = fork();
+	int fd;
+
+	if (pid == 0) {
+		fd = open("/dev/null", O_RDWR);
+		if (fd >= 0) {
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+		}
+		execlp("modprobe", "modprobe", "raidkm", (char *)NULL);
+		_exit(127);
+	}
+	if (pid > 0)
+		waitpid(pid, NULL, 0);
+}
+
 int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 	   struct mddev_dev *devlist, struct shape *s, struct context *c)
 {
@@ -646,8 +667,19 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
 			s->raidkm_rowmap = 1;
 		s->layout |= (s->raidkm_rowmap == 1 ? RAIDKM_LAYOUT_ROWMAP : 0)
 			   | (s->raidkm_snap_pct > 0 ? RAIDKM_LAYOUT_SNAP : 0);
-		if (s->raidkm_rowmap == 1 && s->raidkm_csum == 1) {
-			pr_err("%s is not supported with --checksum yet\n",
+		/* a raidkm module older than this mdadm refuses the row map
+		 * with native checksums only at RUN_ARRAY, after every member
+		 * has been written: load it now (RUN_ARRAY would) and refuse
+		 * first when it cannot (one that can has the rowmap_csum
+		 * parameter).  One that cannot be loaded here is left to
+		 * RUN_ARRAY's autoload. */
+		if (s->raidkm_rowmap == 1 && s->raidkm_csum == 1 &&
+		    access("/sys/module/raidkm", F_OK) != 0)
+			rk_modprobe();
+		if (s->raidkm_rowmap == 1 && s->raidkm_csum == 1 &&
+		    access("/sys/module/raidkm", F_OK) == 0 &&
+		    access("/sys/module/raidkm/parameters/rowmap_csum", F_OK) != 0) {
+			pr_err("the loaded raidkm module does not take --checksum with %s; update it\n",
 			       s->raidkm_snap_pct > 0 ? "--snapshots" : "--row-map");
 			return 1;
 		}

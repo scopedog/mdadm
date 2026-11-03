@@ -1993,6 +1993,19 @@ static bool has_raid0_layout(struct mdp_superblock_1 *sb)
 		return false;
 }
 
+/* the component size in sectors, chunk-rounded: the kernel's dev_sectors */
+static unsigned long long rk_comp_sectors(struct mdp_superblock_1 *sb)
+{
+	unsigned long long comp = __le64_to_cpu(sb->size);
+	unsigned int chunk = __le32_to_cpu(sb->chunksize);
+
+	if (!comp)
+		comp = __le64_to_cpu(sb->data_size);
+	if (chunk)
+		comp -= comp % chunk;
+	return comp;
+}
+
 /* raidkm declustered: byte offset of the rkdcl metadata block.  The KERNEL
  * reads and rewrites it at data_offset + dev_sectors — the COMPONENT size
  * (sb->size), chunk-rounded — so the block floats with a member resize
@@ -2002,27 +2015,42 @@ static bool has_raid0_layout(struct mdp_superblock_1 *sb)
  * --size only this form agrees with the kernel. */
 static unsigned long long rkdcl_blk_off1(struct mdp_superblock_1 *sb)
 {
-	unsigned long long comp = __le64_to_cpu(sb->size);
-	unsigned int chunk = __le32_to_cpu(sb->chunksize);
-
-	if (!comp)
-		comp = __le64_to_cpu(sb->data_size);
-	if (chunk)
-		comp -= comp % chunk;
-	return (__le64_to_cpu(sb->data_offset) + comp) << 9;
+	return (__le64_to_cpu(sb->data_offset) + rk_comp_sectors(sb)) << 9;
 }
 
-/* raidkm --row-map: byte offset of the row map, the start of the tail
- * the row map and then the snapshot metadata take.  Right after the data
- * (the component size, as rkdcl_blk_off1); on a declustered array one
- * chunk later, past the rkdcl block's chunk (km raidkm_rowmap_init). */
-static unsigned long long rkrm_off1(struct mdp_superblock_1 *sb)
+/* raidkm --checksum with --row-map: the CRC region's fixed size in sectors
+ * for @comp sectors of member data (km raidkm_csum_reserve_sectors(), the
+ * same formula): a slot per 4 KiB block, 1022 per 4 KiB page, rounded up to
+ * 64 KiB for kernels with 64 KiB pages.  Without the row map the region
+ * runs to the device end and this is not used. */
+static unsigned long long rkcs_reserve(unsigned long long comp)
+{
+	unsigned long long pages = (comp / 8 + 1021) / 1022;
+
+	return (pages * 8 + 127) / 128 * 128;
+}
+
+/* raidkm --checksum: byte offset of the CRC region (km raidkm_csum_region):
+ * right after the data, one chunk later on a declustered array */
+static unsigned long long rkcs_off1(struct mdp_superblock_1 *sb)
 {
 	unsigned long long off = rkdcl_blk_off1(sb);
 
 	if (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL)
 		off += (unsigned long long)__le32_to_cpu(sb->chunksize) << 9;
 	return off;
+}
+
+/* raidkm --row-map: byte offset of the row map, the start of the tail
+ * the row map and then the snapshot metadata take.  Right after the data
+ * (the component size, as rkdcl_blk_off1); on a declustered array one
+ * chunk later, past the rkdcl block's chunk; with --checksum after the CRC
+ * region (km raidkm_rowmap_init). */
+static unsigned long long rkrm_off1(struct mdp_superblock_1 *sb)
+{
+	return rkcs_off1(sb) +
+	       (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_CSUM ?
+		rkcs_reserve(rk_comp_sectors(sb)) << 9 : 0);
 }
 
 /* raidkm declustered: write the rkdcl metadata block (permutation seed +
@@ -2065,13 +2093,14 @@ static int write_init_rkdcl(struct supertype *st, int fd)
  * read back as damaged map pages, which the kernel can only treat as
  * "every row needs a sync".  Same placement and size as the kernel
  * (km/raid_km-rowmap.c raidkm_rowmap_init): data_offset + the
- * chunk-rounded component size (+ one chunk, declustered), one 4 KiB page per
+ * chunk-rounded component size (+ one chunk, declustered; + the CRC
+ * region, --checksum: rkrm_off1), one 4 KiB page per
  * RAIDKM_ROWMAP_ROWS_PER_PAGE rows.  Also run for a disk --add'ed later. */
 static int write_init_rkrm(struct supertype *st, int fd)
 {
 	struct mdp_superblock_1 *sb = st->sb;
 	unsigned long long off = rkrm_off1(sb);
-	unsigned long long comp = __le64_to_cpu(sb->size);
+	unsigned long long comp = rk_comp_sectors(sb);
 	unsigned int chunk = __le32_to_cpu(sb->chunksize);
 	unsigned long long rows, pages, i;
 	void *buf;
@@ -2097,6 +2126,44 @@ static int write_init_rkrm(struct supertype *st, int fd)
 	return ret;
 }
 
+#ifndef BLKZEROOUT
+#define BLKZEROOUT	_IO(0x12, 127)
+#endif
+
+/* raidkm --checksum with --row-map: zero the CRC region, at create and for
+ * a disk --add'ed later.  The row map skips the initial sync and a rebuild
+ * skips U rows, so nothing rewrites their slots: CRC pages an earlier array
+ * left there -- this one's too, re-created with the same uuid or a member
+ * coming back by a full --add -- would be checked against data they do not
+ * belong to.  A zeroed page has generation 0: never written, every slot
+ * absent.  Without the row map the initial sync and a rebuild re-derive
+ * every CRC, so the region is left alone there. */
+static int write_init_rkcs(struct supertype *st, int fd)
+{
+	struct mdp_superblock_1 *sb = st->sb;
+	unsigned long long off = rkcs_off1(sb);
+	unsigned long long len = rkcs_reserve(rk_comp_sectors(sb)) << 9;
+	unsigned long long range[2] = { off, len }, i;
+	void *buf;
+	int ret = 0;
+
+	if (ioctl(fd, BLKZEROOUT, range) == 0)
+		return 0;
+	if (posix_memalign(&buf, 4096, 1 << 20) != 0)
+		return 1;
+	memset(buf, 0, 1 << 20);
+	for (i = 0; i < len && !ret; i += 1 << 20) {
+		size_t n = len - i >= (1 << 20) ? (1 << 20) : len - i;
+
+		if (pwrite(fd, buf, n, off + i) != (ssize_t)n) {
+			pr_err("failed to zero the checksum region\n");
+			ret = 1;
+		}
+	}
+	free(buf);
+	return ret;
+}
+
 /* raidkm --snapshots: the snapshot metadata region, right after the row
  * map (km/raid_km-snapmeta.c): zero its header, table, pmap and journal
  * pages (the rmap slots are only read where the pmap says a page was
@@ -2109,7 +2176,7 @@ static int write_init_rkrm(struct supertype *st, int fd)
 static int write_init_rksn(struct supertype *st, int fd)
 {
 	struct mdp_superblock_1 *sb = st->sb;
-	unsigned long long comp = __le64_to_cpu(sb->size);
+	unsigned long long comp = rk_comp_sectors(sb);
 	unsigned int chunk = __le32_to_cpu(sb->chunksize);
 	unsigned long long rows, off, pages, jrnl, i, n;
 	unsigned char *buf;
@@ -2371,22 +2438,42 @@ static int write_init_super1(struct supertype *st)
 			sb->data_offset = __cpu_to_le64(data_offset);
 			sb->data_size = __cpu_to_le64(dsize - data_offset);
 			/* raidkm --checksum: reserve a tail region for per-block
-			 * CRC-32C.  Each 4 KiB region page holds 1022 block CRCs
-			 * plus an 8-byte {self_crc,gen} trailer (km/raid_km.c
-			 * RAIDKM_CSUM_PER_PAGE), so one 4 KiB data block (8 sectors)
-			 * costs one slot and the region is ceil(blocks/1022) pages.
-			 * 1022/page is the 4 KiB-PAGE_SIZE worst case; a larger
-			 * PAGE_SIZE packs more slots per page, so this over-reserves
-			 * safely.  The kernel derives the region from
-			 * data_offset+data_size .. device end.  Clamp the component
-			 * size so it stays <= data_size. */
+			 * CRC-32C, rkcs_reserve(): one slot per 4 KiB data
+			 * block, 1022 to a 4 KiB region page (km/raid_km.c
+			 * RAIDKM_CSUM_PER_PAGE: 1022 CRCs + an 8-byte
+			 * {self_crc,gen} trailer), rounded up to 64 KiB, which
+			 * also holds a 64 KiB-page kernel's region.  The kernel
+			 * puts the region at data_offset + dev_sectors (+ the
+			 * rkdcl chunk, declustered); it runs to the device end,
+			 * or with --row-map has exactly rkcs_reserve(dev_sectors)
+			 * and the row map follows (rkrm_off1).
+			 * Without the row map it is sized from this member's
+			 * whole room, so a later --grow --size up to data_size
+			 * still finds room for its CRCs.  With it (no resize:
+			 * the kernel refuses one) from the component size so
+			 * far (the smallest member's, or --size): every member
+			 * takes the same reserve and ends up with the same
+			 * size, and as the component size only shrinks from
+			 * here, the reserve is at least what its final value
+			 * needs; and a member with no room for it is an error,
+			 * as the row map would land on the CRC region.  Clamp
+			 * the component size so it stays <= data_size. */
 			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
 			    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_CSUM)) {
 				unsigned long long usable = dsize - data_offset;
-				unsigned long long blocks = usable / 8;
-				unsigned long long region =
-					(blocks + 1021) / 1022 * 8;
+				unsigned long long comp = usable, region;
+				bool rowmap = __le32_to_cpu(sb->layout) &
+					      RAIDKM_LAYOUT_ROWMAP;
 
+				if (rowmap && rk_comp_sectors(sb) < usable)
+					comp = rk_comp_sectors(sb);
+				region = rkcs_reserve(comp);
+				if (rowmap && usable <= region) {
+					pr_err("%s has no room for the checksum region (%llu KiB)\n",
+					       di->devname, region / 2);
+					rv = 1;
+					goto error_out;
+				}
 				if (usable > region) {
 					usable -= region;
 					sb->data_size = __cpu_to_le64(usable);
@@ -2400,7 +2487,8 @@ static int write_init_super1(struct supertype *st)
 			 * The kernel puts it at data_offset + dev_sectors and
 			 * sizes it from dev_sectors <= data_size, so sizing
 			 * it here from data_size always leaves enough room.
-			 * Not with --checksum (Create.c).  Declustered: the
+			 * With --checksum it follows the CRC region, whose
+			 * reserve the clamp above took.  Declustered: the
 			 * kernel puts it one chunk later, after the rkdcl
 			 * block; the rkdcl reserve below adds that chunk. */
 			if (__le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
@@ -2564,6 +2652,12 @@ static int write_init_super1(struct supertype *st)
 		    __le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
 		    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL))
 			rv = write_init_rkdcl(st, di->fd);
+
+		if (rv == 0 &&
+		    __le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
+		    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_ROWMAP) &&
+		    (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_CSUM))
+			rv = write_init_rkcs(st, di->fd);
 
 		if (rv == 0 &&
 		    __le32_to_cpu(sb->level) == LEVEL_RAIDKM &&
