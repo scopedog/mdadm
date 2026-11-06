@@ -1694,6 +1694,9 @@ int md_array_valid(int fd);
 int md_array_active(int fd);
 int md_array_is_active(struct mdinfo *info);
 int md_get_array_info(int fd, struct mdu_array_info_s *array);
+/* super1.c: raidkm --grow --snapshots on a stopped array */
+int raidkm_grow_snapshots(char *mddev, struct mddev_dev *devlist, int pct,
+			  struct context *c);
 int md_set_array_info(int fd, struct mdu_array_info_s *array);
 int md_get_disk_info(int fd, struct mdu_disk_info_s *disk);
 extern int get_linux_version(void);
@@ -2033,6 +2036,9 @@ static inline int xasprintf(char **strp, const char *fmt, ...) {
  * (super1.c rkrm_off1). */
 #define	RAIDKM_LAYOUT_ROWMAP	(0x0800)
 #define	RAIDKM_ROWMAP_ROWS_PER_PAGE	((4096 - 16) * 4)
+/* a row map page's trailer: id (crc32c of the array uuid), gen, crc32c over
+ * the body + id + gen xor this (km raid_km-rowmap.c rk_rm_page_crc()) */
+#define	RAIDKM_ROWMAP_MAGIC		0x524b524dU	/* "RKRM" */
 /* Native snapshots (bit 12, --snapshots=<reserve %>, implies --row-map): a
  * second tail reserve right after the row map holds the snapshot metadata
  * (km/raid_km_snap.h): header x2, table x2, pmap x2, two rmap slots and a

@@ -413,10 +413,10 @@ int main(int argc, char *argv[])
 				pr_err("Must give one of -a/-r/-f for subsequent devices at %s\n", optarg);
 				exit(2);
 			}
-			if (devs_found > 0 && mode == GROW && !devmode) {
-				pr_err("Must give -a/--add for devices to add: %s\n", optarg);
-				exit(2);
-			}
+			/* GROW: a device without -a/--add is an error unless
+			 * this is raidkm --grow --snapshots, which lists the
+			 * members of the stopped array: checked after parsing,
+			 * so --snapshots may come anywhere */
 			dv = xmalloc(sizeof(*dv));
 			dv->devname = optarg;
 			dv->disposition = devmode;
@@ -763,6 +763,7 @@ int main(int argc, char *argv[])
 			continue;
 
 		case O(CREATE,Snapshots): /* raidkm: --snapshots=<reserve %> */
+		case O(GROW,Snapshots): /* raidkm: add snapshots, array stopped */
 			if (parse_num(&s.raidkm_snap_pct, optarg) != 0 ||
 			    s.raidkm_snap_pct < 1 || s.raidkm_snap_pct > 90) {
 				pr_err("--snapshots needs the reserve in percent of the rows, 1-90 (e.g. --snapshots=20), not %s\n",
@@ -1513,6 +1514,46 @@ int main(int argc, char *argv[])
 		    raidkm_rotating_resume_pending(c.backup_file)) {
 			int rr = raidkm_grow_parity_rotating_resume(c.backup_file, &c);
 			exit(rr ? 1 : 0);
+		}
+
+		if (mode == GROW && !s.raidkm_snap_pct) {
+			struct mddev_dev *dv;
+
+			for (dv = devlist->next; dv; dv = dv->next)
+				if (!dv->disposition) {
+					pr_err("Must give -a/--add for devices to add: %s\n",
+					       dv->devname);
+					exit(2);
+				}
+		}
+		/* raidkm: snapshots are added to a stopped array, from its
+		 * members (super1.c raidkm_grow_snapshots()); any other
+		 * --grow option would be ignored, so it is refused */
+		if (mode == GROW && s.raidkm_snap_pct) {
+			struct mddev_dev *dv;
+			int other = s.raiddisks || s.sparedisks || s.size ||
+				s.level != UnSet || s.layout_str || s.layout != UnSet ||
+				s.chunk || array_size > 0 ||
+				s.parity_count != UnSet || s.raidkm_rotating != UnSet ||
+				s.raidkm_csum != UnSet || s.raidkm_rowmap != UnSet ||
+				s.raidkm_declustered != UnSet ||
+				s.dcl_group_width != UnSet || s.dcl_spare_cols != UnSet ||
+				s.dcl_nbase != UnSet || s.dcl_seed ||
+				s.bitmap_chunk != UnSet || s.btype != BitmapUnknown ||
+				s.write_behind || s.assume_clean ||
+				s.data_offset != INVALID_SECTORS ||
+				s.consistency_policy != CONSISTENCY_POLICY_UNKNOWN ||
+				s.raidkm_grow || c.backup_file;
+
+			for (dv = devlist->next; dv; dv = dv->next)
+				if (dv->disposition)
+					other = 1;
+			if (other) {
+				pr_err("--snapshots cannot be combined with another change in --grow mode (nor -a/-r: list the members bare)\n");
+				exit(2);
+			}
+			exit(raidkm_grow_snapshots(ident.devname, devlist->next,
+						   s.raidkm_snap_pct, &c) ? 1 : 0);
 		}
 
 		if (mode == MANAGE || mode == GROW) {

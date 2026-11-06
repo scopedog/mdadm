@@ -328,6 +328,16 @@ static inline unsigned int choose_ppl_space(int chunk)
 	return (PPL_HEADER_SIZE >> 9) + (chunk > 128*2 ? chunk : 128*2);
 }
 
+/* raidkm: where a member's tail regions start, in sectors from its
+ * data_offset (rk_tail_sectors(), below) */
+struct rk_tail {
+	unsigned long long dcl;		/* the rkdcl block's chunk */
+	unsigned long long csum;	/* the CRC region */
+	unsigned long long map;		/* the row map */
+	unsigned long long snap;	/* the snapshot metadata */
+};
+static void rk_tail_sectors(struct mdp_superblock_1 *sb, struct rk_tail *t);
+
 static void examine_super1(struct supertype *st, char *homehost)
 {
 	struct mdp_superblock_1 *sb = st->sb;
@@ -565,6 +575,17 @@ static void examine_super1(struct supertype *st, char *homehost)
 			printf("        Row Map : on (unused rows are skipped)\n");
 		if (rkl & RAIDKM_LAYOUT_SNAP)
 			printf("      Snapshots : on (md/rk_snap; reserve rows past the array size)\n");
+		if (rkl & (RAIDKM_LAYOUT_CSUM | RAIDKM_LAYOUT_ROWMAP)) {
+			/* the same numbers as md/rk_rowmap csum_region,
+			 * map_region, snap_region (-1: none) */
+			struct rk_tail t;
+
+			rk_tail_sectors(sb, &t);
+			printf("   Tail Regions : csum %lld map %lld snap %lld (sectors past the data start)\n",
+			       rkl & RAIDKM_LAYOUT_CSUM ? (long long)t.csum : -1LL,
+			       rkl & RAIDKM_LAYOUT_ROWMAP ? (long long)t.map : -1LL,
+			       rkl & RAIDKM_LAYOUT_SNAP ? (long long)t.snap : -1LL);
+		}
 	}
 	switch(__le32_to_cpu(sb->level)) {
 	case 0:
@@ -2015,7 +2036,10 @@ static unsigned long long rk_comp_sectors(struct mdp_superblock_1 *sb)
  * --size only this form agrees with the kernel. */
 static unsigned long long rkdcl_blk_off1(struct mdp_superblock_1 *sb)
 {
-	return (__le64_to_cpu(sb->data_offset) + rk_comp_sectors(sb)) << 9;
+	struct rk_tail t;
+
+	rk_tail_sectors(sb, &t);
+	return (__le64_to_cpu(sb->data_offset) + t.dcl) << 9;
 }
 
 /* raidkm --checksum with --row-map: the CRC region's fixed size in sectors
@@ -2030,27 +2054,72 @@ static unsigned long long rkcs_reserve(unsigned long long comp)
 	return (pages * 8 + 127) / 128 * 128;
 }
 
-/* raidkm --checksum: byte offset of the CRC region (km raidkm_csum_region):
- * right after the data, one chunk later on a declustered array */
-static unsigned long long rkcs_off1(struct mdp_superblock_1 *sb)
+/* raidkm --row-map: the row map's 4 KiB pages for @rows rows (km
+ * raidkm_rowmap_init(): RK_RM_ROWS_PER_PAGE states to a page) */
+static unsigned long long rkrm_pages(unsigned long long rows)
 {
-	unsigned long long off = rkdcl_blk_off1(sb);
-
-	if (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_DCL)
-		off += (unsigned long long)__le32_to_cpu(sb->chunksize) << 9;
-	return off;
+	return (rows + RAIDKM_ROWMAP_ROWS_PER_PAGE - 1) /
+	       RAIDKM_ROWMAP_ROWS_PER_PAGE;
 }
 
-/* raidkm --row-map: byte offset of the row map, the start of the tail
- * the row map and then the snapshot metadata take.  Right after the data
- * (the component size, as rkdcl_blk_off1); on a declustered array one
- * chunk later, past the rkdcl block's chunk; with --checksum after the CRC
- * region (km raidkm_rowmap_init). */
+/* raidkm: the tail layout, the one place mdadm works it out.  After the
+ * data (the component size, chunk-rounded: the kernel's dev_sectors), in
+ * this order, each region only with its layout bit (where mdadm works
+ * out where they start):
+ *   the rkdcl block's chunk (declustered),
+ *   the CRC region (--checksum; to the device end, or with the row map
+ *     rkcs_reserve() long),
+ *   the row map (--row-map; rkrm_pages(rows) pages),
+ *   the snapshot metadata (--snapshots, which implies the row map).
+ * The kernel's side is raidkm_tail_start() (raidkm_csum_region(),
+ * raidkm_rowmap_init()) and the snapshot region right after the map; it
+ * prints its offsets in md/rk_rowmap, and --examine prints these
+ * ("Tail Regions"), so tests can compare the two.  The create-time reserve
+ * (write_init_super1) sizes the same regions with the same per-region
+ * helpers (rkcs_reserve, rkrm_pages, rksn_region_pages). */
+static void rk_tail_sectors(struct mdp_superblock_1 *sb, struct rk_tail *t)
+{
+	unsigned int layout = __le32_to_cpu(sb->layout);
+	unsigned long long chunk = __le32_to_cpu(sb->chunksize);
+	unsigned long long comp = rk_comp_sectors(sb);
+
+	t->dcl = comp;
+	t->csum = comp + (layout & RAIDKM_LAYOUT_DCL ? chunk : 0);
+	/* the CRC region has a fixed size only with the row map (snapshots
+	 * imply it); without, it runs to the device end and nothing follows */
+	t->map = t->csum +
+		 ((layout & RAIDKM_LAYOUT_CSUM) &&
+		  (layout & (RAIDKM_LAYOUT_ROWMAP | RAIDKM_LAYOUT_SNAP)) ?
+		  rkcs_reserve(comp) : 0);
+	t->snap = t->map +
+		  (layout & (RAIDKM_LAYOUT_ROWMAP | RAIDKM_LAYOUT_SNAP) && chunk ?
+		   rkrm_pages(comp / chunk) * 8 : 0);
+}
+
+/* byte offsets on a member of the CRC region, the row map and the
+ * snapshot metadata (rk_tail_sectors()) */
+static unsigned long long rkcs_off1(struct mdp_superblock_1 *sb)
+{
+	struct rk_tail t;
+
+	rk_tail_sectors(sb, &t);
+	return (__le64_to_cpu(sb->data_offset) + t.csum) << 9;
+}
+
 static unsigned long long rkrm_off1(struct mdp_superblock_1 *sb)
 {
-	return rkcs_off1(sb) +
-	       (__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_CSUM ?
-		rkcs_reserve(rk_comp_sectors(sb)) << 9 : 0);
+	struct rk_tail t;
+
+	rk_tail_sectors(sb, &t);
+	return (__le64_to_cpu(sb->data_offset) + t.map) << 9;
+}
+
+static unsigned long long rksn_off1(struct mdp_superblock_1 *sb)
+{
+	struct rk_tail t;
+
+	rk_tail_sectors(sb, &t);
+	return (__le64_to_cpu(sb->data_offset) + t.snap) << 9;
 }
 
 /* raidkm declustered: write the rkdcl metadata block (permutation seed +
@@ -2109,8 +2178,7 @@ static int write_init_rkrm(struct supertype *st, int fd)
 	if (!chunk)
 		return 1;
 	rows = comp / chunk;
-	pages = (rows + RAIDKM_ROWMAP_ROWS_PER_PAGE - 1) /
-		RAIDKM_ROWMAP_ROWS_PER_PAGE;
+	pages = rkrm_pages(rows);
 	if (posix_memalign(&buf, 4096, 65536) != 0)
 		return 1;
 	memset(buf, 0, 65536);
@@ -2186,9 +2254,7 @@ static int write_init_rksn(struct supertype *st, int fd)
 	if (!chunk)
 		return 1;
 	rows = comp / chunk;
-	off = rkrm_off1(sb) +
-	      (rows + RAIDKM_ROWMAP_ROWS_PER_PAGE - 1) /
-	      RAIDKM_ROWMAP_ROWS_PER_PAGE * 4096;
+	off = rksn_off1(sb);
 	pages = rksn_region_pages(rows);
 	jrnl = RKSN_OFF_PMAP + 2 * rksn_pmap_pages(rows) +
 	       2 * rksn_rmap_pages(rows);
@@ -2234,6 +2300,453 @@ static int write_init_rksn(struct supertype *st, int fd)
 	}
 	free(buf);
 	return ret;
+}
+
+/*
+ * raidkm: add native snapshots to an existing --row-map array, offline:
+ *
+ *   mdadm --grow /dev/mdX --snapshots=<pct> <every member>   (array stopped)
+ *
+ * What --snapshots needs that the array lacks: room for the snapshot
+ * metadata after the row map, and the reserve -- the top pct% of the rows,
+ * which the origin stops exporting.  Both come out of the data area: the
+ * component size shrinks by the new tail rounded up to a chunk, the tail
+ * regions (rkdcl block, CRC region, row map) are copied down to the new
+ * component end, and the snapshot region is initialised after them.  The
+ * kernel sizes the origin from the init header at the first assemble, as
+ * for a new array.
+ *
+ * Safe because every row the conversion takes -- the new tail and the
+ * reserve, rows from the new origin size up -- must be U (unwritten) in the
+ * row map: the user shrinks the filesystem and discards the rest first.  The
+ * new tail lies wholly below the old one, in those rows, so until the
+ * superblocks change the old array is untouched.  The superblocks are
+ * written one member at a time (not atomic, as any offline update); a
+ * member already converted (snapshots, the new size, events + 1) is left
+ * alone, so running the command again finishes an interrupted one.
+ */
+struct rkgs_member {
+	char *name;
+	int fd;
+	struct supertype *st;
+	int role;
+	int done;	/* already converted */
+};
+
+/* the tail of an array with snapshots after @comp sectors of data, in
+ * sectors: rk_tail_sectors() on a copy of @sb set to that geometry, plus the
+ * snapshot region (which the create-time reserve sizes the same way).
+ * @chunk is not 0. */
+static unsigned long long rkgs_tail(struct mdp_superblock_1 *sb,
+				    unsigned long long comp)
+{
+	struct mdp_superblock_1 t = *sb;
+	struct rk_tail rt;
+
+	t.size = __cpu_to_le64(comp);
+	t.layout = __cpu_to_le32(__le32_to_cpu(sb->layout) | RAIDKM_LAYOUT_SNAP);
+	rk_tail_sectors(&t, &rt);
+	return rt.snap - rk_comp_sectors(&t) +
+	       rksn_region_pages(comp / __le32_to_cpu(sb->chunksize)) * 8;
+}
+
+/* the reserve a converted member's snapshot header names, 0 if none */
+static unsigned int rkgs_hdr_pct(int fd, struct mdp_superblock_1 *sb)
+{
+	struct rksn_hdr *h;
+	unsigned int pct = 0;
+	void *b;
+
+	if (posix_memalign(&b, 4096, 4096))
+		return 0;
+	h = b;
+	if (pread(fd, b, 4096, rksn_off1(sb)) == 4096 &&
+	    __le32_to_cpu(h->magic) == RKSN_MAGIC_HDR)
+		pct = __le32_to_cpu(h->reserve_pct);
+	free(b);
+	return pct;
+}
+
+static int rkgs_copy(int fd, unsigned long long from, unsigned long long to,
+		     unsigned long long len, void *buf, size_t bsz)
+{
+	unsigned long long i;
+
+	for (i = 0; i < len; i += bsz) {
+		size_t n = len - i < bsz ? len - i : bsz;
+
+		ssize_t r = pread(fd, buf, n, from + i);
+
+		if (r == (ssize_t)n)
+			r = pwrite(fd, buf, n, to + i);
+		if (r != (ssize_t)n) {
+			if (r >= 0)
+				errno = EIO;	/* short: past the device end */
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* first row in [first, last) the row map does not call U (unwritten), read
+ * from the members' copies as the kernel loads them (the newest good copy
+ * of each page; none: never written, all U; only damaged ones: not U).
+ * last when there is none, ~0ULL on a read error. */
+static unsigned long long rkgs_first_used(struct rkgs_member *mb, int n,
+					  unsigned long long first,
+					  unsigned long long last)
+{
+	struct mdp_superblock_1 *sb0 = NULL;
+	unsigned char *buf, *best;
+	unsigned long long p, r, ret = last;
+	__u32 id;
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (!mb[i].done)
+			sb0 = mb[i].st->sb;
+	if (!sb0 || first >= last)
+		return last;
+	id = crc32c_le(0, (unsigned char *)sb0->set_uuid, sizeof(sb0->set_uuid));
+	if (posix_memalign((void **)&buf, 4096, 4096))
+		return ~0ULL;
+	if (posix_memalign((void **)&best, 4096, 4096)) {
+		free(buf);
+		return ~0ULL;
+	}
+	for (p = first / RAIDKM_ROWMAP_ROWS_PER_PAGE;
+	     p * RAIDKM_ROWMAP_ROWS_PER_PAGE < last && ret == last; p++) {
+		unsigned long long bgen = 0, gen;
+		int have = 0, bad = 0;
+		unsigned long long lo, hi;
+
+		for (i = 0; i < n; i++) {
+			struct mdp_superblock_1 *sb = mb[i].st->sb;
+			__u32 crc;
+			size_t z;
+
+			if (mb[i].done)
+				continue;
+			if (pread(mb[i].fd, buf, 4096, rkrm_off1(sb) + p * 4096) != 4096) {
+				ret = ~0ULL;
+				goto out;
+			}
+			for (z = 0; z < 4096 && !buf[z]; z++)
+				;
+			if (z == 4096)
+				continue;		/* never written */
+			crc = crc32c_le(0, buf, 4096 - 16 + 12) ^ RAIDKM_ROWMAP_MAGIC;
+			if (__le32_to_cpu(*(__u32 *)(buf + 4096 - 16 + 12)) != crc ||
+			    __le32_to_cpu(*(__u32 *)(buf + 4096 - 16)) != id) {
+				bad = 1;
+				continue;
+			}
+			gen = __le64_to_cpu(*(__u64 *)(buf + 4096 - 16 + 4));
+			if (!have || gen > bgen) {
+				memcpy(best, buf, 4096);
+				bgen = gen;
+				have = 1;
+			}
+		}
+		lo = p * RAIDKM_ROWMAP_ROWS_PER_PAGE;
+		hi = lo + RAIDKM_ROWMAP_ROWS_PER_PAGE;
+		if (lo < first)
+			lo = first;
+		if (hi > last)
+			hi = last;
+		if (!have) {
+			if (bad)
+				ret = lo;	/* damaged everywhere: may hold data */
+			continue;
+		}
+		for (r = lo; r < hi; r++) {
+			unsigned long long o = r - p * RAIDKM_ROWMAP_ROWS_PER_PAGE;
+
+			if ((best[o >> 2] >> ((o & 3) * 2)) & 3) {
+				ret = r;
+				break;
+			}
+		}
+	}
+out:
+	free(buf);
+	free(best);
+	return ret;
+}
+
+int raidkm_grow_snapshots(char *mddev, struct mddev_dev *devlist, int pct,
+			  struct context *c)
+{
+	struct rkgs_member *mb = NULL;
+	struct mdp_superblock_1 *ref = NULL, *tsb = NULL, *sb;
+	struct mddev_dev *dv;
+	unsigned long long comp = 0, ncomp, chunk, rows, nrows, O, rs, events = 0;
+	unsigned long long used, tail;
+	unsigned int layout = 0, raid_disks, m, cols;
+	long page;
+	int n = 0, i, j, todo = 0, rv = 1, mfd;
+	void *buf = NULL;
+	mdu_array_info_t a;
+
+	mfd = open(mddev, O_RDONLY);
+	if (mfd >= 0) {
+		if (md_get_array_info(mfd, &a) == 0) {
+			pr_err("%s is active: --grow --snapshots works on a stopped array (mdadm --stop %s)\n",
+			       mddev, mddev);
+			close(mfd);
+			return 1;
+		}
+		close(mfd);
+	}
+	for (dv = devlist; dv; dv = dv->next)
+		n++;
+	if (!n) {
+		pr_err("--grow --snapshots on a stopped array needs every member listed: mdadm --grow %s --snapshots=%d <members>\n",
+		       mddev, pct);
+		return 1;
+	}
+	mb = xcalloc(n, sizeof(*mb));
+	for (i = 0; i < n; i++)
+		mb[i].fd = -1;
+	for (i = 0, dv = devlist; dv; dv = dv->next, i++) {
+		mb[i].name = dv->devname;
+		mb[i].fd = dev_open(dv->devname, O_RDWR | O_EXCL);
+		if (mb[i].fd < 0) {
+			pr_err("cannot open %s: %s\n", dv->devname, strerror(errno));
+			goto out;
+		}
+		mb[i].st = guess_super(mb[i].fd);
+		if (!mb[i].st || mb[i].st->ss != &super1 ||
+		    mb[i].st->ss->load_super(mb[i].st, mb[i].fd, NULL)) {
+			pr_err("%s has no 1.x superblock\n", dv->devname);
+			goto out;
+		}
+		sb = mb[i].st->sb;
+		if (!ref)
+			ref = sb;
+		if (__le32_to_cpu(sb->level) != LEVEL_RAIDKM) {
+			pr_err("%s: not a raidkm member: --snapshots is for raidkm arrays\n", dv->devname);
+			goto out;
+		}
+		if (memcmp(sb->set_uuid, ref->set_uuid, sizeof(sb->set_uuid))) {
+			pr_err("%s is not a member of the same array as %s\n", dv->devname, mb[0].name);
+			goto out;
+		}
+		if (__le32_to_cpu(sb->feature_map) &
+		    (MD_FEATURE_RESHAPE_ACTIVE | MD_FEATURE_RECOVERY_OFFSET |
+		     MD_FEATURE_REPLACEMENT | MD_FEATURE_JOURNAL | MD_FEATURE_PPL)) {
+			pr_err("%s: a reshape, rebuild, replacement, journal or PPL: refused (the array must be clean and whole)\n",
+			       dv->devname);
+			goto out;
+		}
+		if (__le32_to_cpu(sb->feature_map) & MD_FEATURE_BITMAP_OFFSET) {
+			pr_err("%s: the array has an internal bitmap: remove it first (mdadm --grow %s --bitmap=none)\n",
+			       dv->devname, mddev);
+			goto out;
+		}
+		if (__le64_to_cpu(sb->resync_offset) != MaxSector) {
+			pr_err("%s: the array was not stopped clean: assemble it and let it sync first\n",
+			       dv->devname);
+			goto out;
+		}
+		mb[i].role = __le16_to_cpu(sb->dev_roles[__le32_to_cpu(sb->dev_number)]);
+		mb[i].done = !!(__le32_to_cpu(sb->layout) & RAIDKM_LAYOUT_SNAP);
+		if (!mb[i].done) {
+			if (todo && (__le32_to_cpu(sb->layout) != layout ||
+				     rk_comp_sectors(sb) != comp ||
+				     __le64_to_cpu(sb->events) != events)) {
+				pr_err("%s: geometry or event count differs from the other members\n",
+				       dv->devname);
+				goto out;
+			}
+			layout = __le32_to_cpu(sb->layout);
+			comp = rk_comp_sectors(sb);
+			tsb = sb;
+			events = __le64_to_cpu(sb->events);
+			todo++;
+		}
+	}
+	raid_disks = __le32_to_cpu(ref->raid_disks);
+	if (n != (int)raid_disks) {
+		pr_err("%d device(s) given, the array has %u: list every member (and no spare: remove spares first)\n",
+		       n, raid_disks);
+		goto out;
+	}
+	for (i = 0; i < n; i++) {
+		if (mb[i].role >= (int)raid_disks) {
+			pr_err("%s is a spare (or failed): remove it from the array first\n", mb[i].name);
+			goto out;
+		}
+		for (j = 0; j < i; j++)
+			if (mb[j].role == mb[i].role) {
+				pr_err("%s and %s are both member %d\n", mb[j].name, mb[i].name, mb[i].role);
+				goto out;
+			}
+	}
+	if (!todo) {
+		printf("mdadm: %s already has snapshots: nothing to do\n", mddev);
+		rv = 0;
+		goto out;
+	}
+	if (!(layout & RAIDKM_LAYOUT_ROWMAP)) {
+		pr_err("%s has no row map: --snapshots needs one, and an array gets it only at create (--row-map)\n",
+		       mddev);
+		goto out;
+	}
+	chunk = __le32_to_cpu(ref->chunksize);
+	m = layout & RAIDKM_LAYOUT_M_MASK;
+	if (layout & RAIDKM_LAYOUT_DCL) {
+		unsigned int g = RAIDKM_LAYOUT_DCL_G(layout), s = RAIDKM_LAYOUT_DCL_S(layout);
+
+		cols = (raid_disks - s) / g * (g - m);
+	} else {
+		cols = raid_disks - m;
+	}
+	if (!chunk || !cols) {
+		pr_err("%s: no chunk size or no data columns in the superblock\n", mddev);
+		goto out;
+	}
+	rs = chunk * cols;			/* array sectors per row */
+	tail = (rkgs_tail(tsb, comp) + chunk - 1) / chunk * chunk;
+	if (tail >= comp) {
+		pr_err("the array is too small for snapshots\n");
+		goto out;
+	}
+	ncomp = comp - tail;
+	rows = comp / chunk;
+	nrows = ncomp / chunk;
+	O = nrows * (100 - pct) / 100;		/* km rk_sn_load(), init header */
+	if (!O || O >= nrows) {
+		pr_err("the array is too small for a %d%% reserve\n", pct);
+		goto out;
+	}
+	/* what raidkm_snap_init() refuses: checked here, as the conversion
+	 * cannot be undone and the kernel would refuse it only at assemble */
+	if (nrows >= 0xffffffffULL) {
+		pr_err("%llu rows: snapshots take at most %u (a larger chunk)\n",
+		       nrows, 0xfffffffeU);
+		goto out;
+	}
+	page = sysconf(_SC_PAGESIZE);
+	if (page < 4096)
+		page = 4096;
+	if ((rs << 9) % page) {
+		pr_err("a row is %llu bytes, not a whole number of %ld-byte pages: snapshots need that\n",
+		       rs << 9, page);
+		goto out;
+	}
+	for (i = 0; i < n; i++)
+		if (mb[i].done) {
+			struct mdp_superblock_1 *d = mb[i].st->sb;
+			unsigned int dp = rkgs_hdr_pct(mb[i].fd, d);
+
+			if (rk_comp_sectors(d) != ncomp ||
+			    __le32_to_cpu(d->layout) != (layout | RAIDKM_LAYOUT_SNAP) ||
+			    __le64_to_cpu(d->events) != events + 1) {
+				/* an interrupted conversion whose converted members
+				 * were then assembled (incremental assembly at
+				 * boot): they run in the new geometry, and the
+				 * others -- whose new tail step 1 already wrote --
+				 * go back in with --add, as any stale member */
+				pr_err("%s has snapshots but not this conversion's geometry or event count: refused.\n"
+				       "    If the converted members were assembled since, assemble them and --add the others.\n",
+				       mb[i].name);
+				goto out;
+			}
+			if (dp != (unsigned int)pct) {
+				pr_err("%s was converted with --snapshots=%u: finish with that value\n",
+				       mb[i].name, dp);
+				goto out;
+			}
+		}
+	used = rkgs_first_used(mb, n, O, rows);
+	if (used == ~0ULL) {
+		pr_err("cannot read the row map\n");
+		goto out;
+	}
+	if (used < rows) {
+		pr_err("row %llu holds data: with a %d%% reserve the origin ends at row %llu.\n"
+		       "    Shrink the filesystem to at most %llu bytes, discard the rest and stop again:\n"
+		       "      mdadm --assemble %s ...; blkdiscard -o %llu %s; mdadm --stop %s\n",
+		       used, pct, O, O * rs * 512, mddev, O * rs * 512, mddev, mddev);
+		goto out;
+	}
+	if (c->verbose >= 0)
+		printf("mdadm: %s: origin %llu of %llu rows (%llu bytes), reserve %llu rows; component size %llu -> %llu sectors\n"
+		       "mdadm: what is on the array (a filesystem) must fit in those %llu bytes: mdadm cannot check that\n",
+		       mddev, O, nrows, O * rs * 512, nrows - O, comp, ncomp,
+		       O * rs * 512);
+
+	/* 1. the new tail on every member still to convert: below the old
+	 * one, in U rows -- the old array is untouched until step 2 */
+	if (posix_memalign(&buf, 4096, 1 << 20))
+		goto out;
+	for (i = 0; i < n; i++) {
+		struct rk_tail to, tn;
+		unsigned long long doff;
+
+		if (mb[i].done)
+			continue;
+		sb = mb[i].st->sb;
+		doff = __le64_to_cpu(sb->data_offset) << 9;
+		rk_tail_sectors(sb, &to);
+		sb->size = __cpu_to_le64(ncomp);
+		sb->layout = __cpu_to_le32(layout | RAIDKM_LAYOUT_SNAP);
+		rk_tail_sectors(sb, &tn);
+		if (((layout & RAIDKM_LAYOUT_DCL) &&
+		     rkgs_copy(mb[i].fd, doff + (to.dcl << 9), doff + (tn.dcl << 9),
+			       RKDCL_SB_BYTES, buf, 1 << 20)) ||
+		    ((layout & RAIDKM_LAYOUT_CSUM) &&
+		     rkgs_copy(mb[i].fd, doff + (to.csum << 9), doff + (tn.csum << 9),
+			       rkcs_reserve(ncomp) << 9, buf, 1 << 20)) ||
+		    rkgs_copy(mb[i].fd, doff + (to.map << 9), doff + (tn.map << 9),
+			      rkrm_pages(nrows) * 4096, buf, 1 << 20)) {
+			pr_err("%s: copying the tail regions failed: %s (nothing changed yet)\n",
+			       mb[i].name, strerror(errno));
+			goto out;
+		}
+		mb[i].st->raidkm_snap_pct = pct;
+		if (write_init_rksn(mb[i].st, mb[i].fd) || fsync(mb[i].fd)) {
+			pr_err("%s: writing the snapshot metadata failed (nothing changed yet)\n",
+			       mb[i].name);
+			goto out;
+		}
+	}
+	/* 2. the superblocks.  MDADM_TEST_GROW_SNAP_STOP=<k>: testing only,
+	 * stop after k of them, as a crash would */
+	for (i = 0, j = getenv("MDADM_TEST_GROW_SNAP_STOP") ?
+			atoi(getenv("MDADM_TEST_GROW_SNAP_STOP")) : -1;
+	     i < n; i++) {
+		if (mb[i].done)
+			continue;
+		if (j-- == 0) {
+			pr_err("MDADM_TEST_GROW_SNAP_STOP: stopping before %s\n", mb[i].name);
+			goto out;
+		}
+		sb = mb[i].st->sb;
+		sb->events = __cpu_to_le64(events + 1);
+		sb->utime = __cpu_to_le64(time(0));
+		sb->sb_csum = calc_sb_1_csum(sb);
+		if (mb[i].st->ss->store_super(mb[i].st, mb[i].fd)) {
+			pr_err("%s: writing the superblock failed: run the same command again to finish\n",
+			       mb[i].name);
+			goto out;
+		}
+	}
+	printf("mdadm: %s now has snapshots (reserve %d%%): assemble it as before\n", mddev, pct);
+	rv = 0;
+out:
+	free(buf);
+	for (i = 0; i < n && mb; i++) {
+		if (mb[i].st) {
+			mb[i].st->ss->free_super(mb[i].st);
+			free(mb[i].st);
+		}
+		if (mb[i].fd >= 0)
+			close(mb[i].fd);
+	}
+	free(mb);
+	return rv;
 }
 
 /* raidkm declustered: recover the permutation seed + nbase into st->rkdcl_*
@@ -2502,8 +3015,7 @@ static int write_init_super1(struct supertype *st)
 				if (chunk < 8)
 					chunk = 8;
 				rows = usable / chunk;
-				region = (rows + RAIDKM_ROWMAP_ROWS_PER_PAGE - 1) /
-					 RAIDKM_ROWMAP_ROWS_PER_PAGE * 8;
+				region = rkrm_pages(rows) * 8;
 				if (usable > region + chunk) {
 					usable -= region;
 					usable -= usable % chunk;
